@@ -134,36 +134,17 @@ async function makeClaudeCodeRequestWithOAuth(
       `   [Debug] Request body keys: ${Object.keys(preparedBody).join(", ")}`
     );
 
-    // Build beta headers - merge Claude Code headers with any existing ones from Cursor
-    const existingBetas = headers["anthropic-beta"] || "";
-    // Combine: Claude Code headers first, then any additional ones from Cursor
-    // Use Set to deduplicate if there are overlaps
-    const betaSet = new Set<string>();
-
-    // Add Claude Code required headers
-    for (const beta of CLAUDE_CODE_BETA_HEADERS.split(",")) {
-      betaSet.add(beta.trim());
-    }
-
-    // Add any existing betas from Cursor
-    if (existingBetas) {
-      for (const beta of existingBetas.split(",")) {
-        betaSet.add(beta.trim());
-      }
-    }
-
-    const allBetas = Array.from(betaSet).join(",");
-
+    // Use ONLY our Claude Code beta headers - don't merge with Cursor's
+    // Cursor may send incompatible headers like "context-1m-2025-08-07"
     console.log(
-      `   [Debug] Beta headers - Original: "${existingBetas}", Merged: "${allBetas}"`
+      `   [Debug] Using Claude Code beta headers: "${CLAUDE_CODE_BETA_HEADERS}"`
     );
 
     const response = await fetch(`${ANTHROPIC_API_URL}${endpoint}`, {
       method: "POST",
       headers: {
-        ...headers,
         Authorization: `Bearer ${token.accessToken}`,
-        "anthropic-beta": allBetas,
+        "anthropic-beta": CLAUDE_CODE_BETA_HEADERS,
         "anthropic-version": "2023-06-01",
         "Content-Type": "application/json",
         "User-Agent": "claude-code/1.0.85",

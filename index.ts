@@ -6,6 +6,8 @@ import {
   anthropicToOpenai,
   createOpenAIStreamChunk,
   createOpenAIStreamStart,
+  createOpenAIToolCallChunk,
+  parseXMLToolCalls,
   type OpenAIChatRequest,
 } from "./src/openai-adapter";
 import {
@@ -535,6 +537,12 @@ const server = Bun.serve({
               const HEARTBEAT_INTERVAL = 5000; // Send heartbeat every 5 seconds if buffering
               let currentBlockIndex = -1; // Track which content block we're processing
               let blockTextSent = false; // Track if we've sent text from content_block_start
+              let toolCallIndex = 0; // Track tool call index for OpenAI format
+              let currentToolCall: {
+                id: string;
+                name: string;
+                inputJson: string;
+              } | null = null; // Current tool_use block being streamed
 
               // Helper to safely enqueue data
               const safeEnqueue = (data: Uint8Array) => {
@@ -546,32 +554,6 @@ const server = Bun.serve({
                   // Controller might be closed, ignore
                   cancelled = true;
                 }
-              };
-
-              // Helper to process and translate tool call buffer
-              const processToolCallBuffer = (
-                force: boolean = false
-              ): string => {
-                if (!toolCallBuffer) return "";
-
-                // Check if we have a complete tool call (has closing tag)
-                const hasCompleteToolCall =
-                  /<\/invoke>/i.test(toolCallBuffer) ||
-                  /<\/function_calls>/i.test(toolCallBuffer) ||
-                  /<\/search_files>/i.test(toolCallBuffer) ||
-                  /<\/read_file>/i.test(toolCallBuffer);
-
-                // Process if complete or forced (end of stream)
-                if (hasCompleteToolCall || force) {
-                  const translated = translateToolCalls(toolCallBuffer);
-                  const result = translated;
-                  toolCallBuffer = "";
-                  inToolCall = false;
-                  return result;
-                }
-
-                // Not complete yet, keep buffering
-                return "";
               };
 
               try {
@@ -670,75 +652,87 @@ const server = Bun.serve({
                           logger.verbose(
                             `   [Debug] content_block_start text block (${textContent.length} chars): ${textContent}`
                           );
+                          // Text blocks are handled in content_block_delta
+                        }
 
-                          // Check if text contains tool calls and translate immediately
-                          if (needsTranslation(textContent)) {
-                            logger.verbose(
-                              `   [Debug] Found tool calls in content_block_start! Translating...`
-                            );
-                            const translated = translateToolCalls(textContent);
-                            if (translated !== textContent) {
-                              logger.verbose(
-                                `   [Debug] Translated tool call in content_block_start:\n     Original (${
-                                  textContent.length
-                                } chars):\n${textContent
-                                  .split("\n")
-                                  .map((l: string) => `       ${l}`)
-                                  .join("\n")}\n     Translated (${
-                                  translated.length
-                                } chars):\n${translated
-                                  .split("\n")
-                                  .map((l: string) => `       ${l}`)
-                                  .join("\n")}`
-                              );
+                        // Handle tool_use blocks - Anthropic's native tool call format
+                        if (block?.type === "tool_use") {
+                          logger.verbose(
+                            `   [Debug] tool_use block started: id=${block.id}, name=${block.name}`
+                          );
 
-                              // Send the translated text as a delta chunk
-                              safeEnqueue(
-                                new TextEncoder().encode(
-                                  createOpenAIStreamChunk(
-                                    streamId,
-                                    openaiBody.model,
-                                    translated
-                                  )
-                                )
-                              );
-                              blockTextSent = true;
-                            } else {
-                              // Translation didn't change anything, send original
-                              safeEnqueue(
-                                new TextEncoder().encode(
-                                  createOpenAIStreamChunk(
-                                    streamId,
-                                    openaiBody.model,
-                                    textContent
-                                  )
-                                )
-                              );
-                              blockTextSent = true;
-                            }
-                          } else {
-                            // No tool calls, send the text as-is
-                            safeEnqueue(
-                              new TextEncoder().encode(
-                                createOpenAIStreamChunk(
-                                  streamId,
-                                  openaiBody.model,
-                                  textContent
-                                )
+                          // Store current tool call info for accumulating input
+                          currentToolCall = {
+                            id: block.id,
+                            name: block.name,
+                            inputJson: "",
+                          };
+
+                          // Send the first OpenAI tool call chunk (id, type, function.name)
+                          safeEnqueue(
+                            new TextEncoder().encode(
+                              createOpenAIToolCallChunk(
+                                streamId,
+                                openaiBody.model,
+                                toolCallIndex,
+                                block.id,
+                                block.name,
+                                undefined,
+                                null
                               )
-                            );
-                            blockTextSent = true;
-                          }
+                            )
+                          );
                         }
                       }
 
-                      // Handle content_block_stop - reset block tracking
+                      // Handle content_block_stop - reset block tracking and finalize tool calls
                       if (event.type === "content_block_stop") {
                         logger.verbose(
                           `   [Debug] content_block_stop for index ${event.index}`
                         );
+
+                        // If we were building a tool call, send the final arguments chunk
+                        if (currentToolCall) {
+                          logger.verbose(
+                            `   [Debug] Finalizing tool call: ${currentToolCall.name} with args: ${currentToolCall.inputJson}`
+                          );
+
+                          // Send the arguments chunk
+                          safeEnqueue(
+                            new TextEncoder().encode(
+                              createOpenAIToolCallChunk(
+                                streamId,
+                                openaiBody.model,
+                                toolCallIndex,
+                                undefined,
+                                undefined,
+                                currentToolCall.inputJson || "{}",
+                                null
+                              )
+                            )
+                          );
+
+                          toolCallIndex++;
+                          currentToolCall = null;
+                        }
+
                         blockTextSent = false;
                         currentBlockIndex = -1;
+                      }
+
+                      // Handle input_json_delta for tool_use blocks
+                      if (
+                        event.type === "content_block_delta" &&
+                        event.delta?.type === "input_json_delta" &&
+                        currentToolCall
+                      ) {
+                        const jsonChunk = event.delta.partial_json || "";
+                        currentToolCall.inputJson += jsonChunk;
+                        logger.verbose(
+                          `   [Debug] input_json_delta: "${jsonChunk}" (total: ${currentToolCall.inputJson.length} chars)`
+                        );
+                        // Don't send anything yet - accumulate until content_block_stop
+                        continue;
                       }
 
                       // Handle content_block_delta events
@@ -918,10 +912,9 @@ const server = Bun.serve({
                           }
 
                           if (completeToolCall) {
-                            // Process and translate the complete tool call
-                            const translated =
-                              translateToolCalls(completeToolCall);
-                            text = translated;
+                            // Parse the XML tool call into structured format
+                            const parsedToolCalls =
+                              parseXMLToolCalls(completeToolCall);
 
                             // Update buffer with remaining content
                             toolCallBuffer = remainingBuffer;
@@ -929,30 +922,71 @@ const server = Bun.serve({
                               inToolCall = false;
                             }
 
-                            logger.verbose(
-                              `   [Debug] Translated complete tool call:\n     Original (${
-                                completeToolCall.length
-                              } chars):\n${completeToolCall
-                                .split("\n")
-                                .map((l: string) => `       ${l}`)
-                                .join("\n")}\n     Translated (${
-                                translated.length
-                              } chars):\n${translated
-                                .split("\n")
-                                .map((l: string) => `       ${l}`)
-                                .join("\n")}`
-                            );
+                            if (parsedToolCalls.length > 0) {
+                              logger.verbose(
+                                `   [Debug] Parsed ${
+                                  parsedToolCalls.length
+                                } tool call(s) from XML:\n${JSON.stringify(
+                                  parsedToolCalls,
+                                  null,
+                                  2
+                                )}`
+                              );
 
-                            // Send the translated tool call
-                            safeEnqueue(
-                              new TextEncoder().encode(
-                                createOpenAIStreamChunk(
-                                  streamId,
-                                  openaiBody.model,
-                                  text
+                              // Emit OpenAI tool_calls format for each parsed tool call
+                              for (const [i, tc] of parsedToolCalls.entries()) {
+                                const toolCallId = `call_${Date.now()}_${i}`;
+
+                                // First chunk: id, type, function.name
+                                safeEnqueue(
+                                  new TextEncoder().encode(
+                                    createOpenAIToolCallChunk(
+                                      streamId,
+                                      openaiBody.model,
+                                      toolCallIndex,
+                                      toolCallId,
+                                      tc.name,
+                                      undefined,
+                                      null
+                                    )
+                                  )
+                                );
+
+                                // Second chunk: function.arguments (as JSON string)
+                                safeEnqueue(
+                                  new TextEncoder().encode(
+                                    createOpenAIToolCallChunk(
+                                      streamId,
+                                      openaiBody.model,
+                                      toolCallIndex,
+                                      undefined,
+                                      undefined,
+                                      JSON.stringify(tc.arguments),
+                                      null
+                                    )
+                                  )
+                                );
+
+                                toolCallIndex++;
+                              }
+                            } else {
+                              // Fallback: couldn't parse, send as text
+                              logger.verbose(
+                                `   [Debug] Could not parse tool call, sending as text: ${completeToolCall.substring(
+                                  0,
+                                  100
+                                )}...`
+                              );
+                              safeEnqueue(
+                                new TextEncoder().encode(
+                                  createOpenAIStreamChunk(
+                                    streamId,
+                                    openaiBody.model,
+                                    completeToolCall
+                                  )
                                 )
-                              )
-                            );
+                              );
+                            }
                             continue;
                           } else {
                             // Still buffering incomplete tool call
@@ -1016,22 +1050,64 @@ const server = Bun.serve({
                       if (event.type === "message_stop") {
                         // Flush any remaining tool call buffer (force flush)
                         if (toolCallBuffer) {
-                          const processed = processToolCallBuffer(true);
-                          if (processed) {
+                          const parsedToolCalls =
+                            parseXMLToolCalls(toolCallBuffer);
+                          if (parsedToolCalls.length > 0) {
+                            for (const [i, tc] of parsedToolCalls.entries()) {
+                              const toolCallId = `call_${Date.now()}_${i}`;
+
+                              safeEnqueue(
+                                new TextEncoder().encode(
+                                  createOpenAIToolCallChunk(
+                                    streamId,
+                                    openaiBody.model,
+                                    toolCallIndex,
+                                    toolCallId,
+                                    tc.name,
+                                    undefined,
+                                    null
+                                  )
+                                )
+                              );
+
+                              safeEnqueue(
+                                new TextEncoder().encode(
+                                  createOpenAIToolCallChunk(
+                                    streamId,
+                                    openaiBody.model,
+                                    toolCallIndex,
+                                    undefined,
+                                    undefined,
+                                    JSON.stringify(tc.arguments),
+                                    null
+                                  )
+                                )
+                              );
+
+                              toolCallIndex++;
+                            }
+                            logger.verbose(
+                              `   [Debug] Flushed final tool call buffer: ${parsedToolCalls.length} tool calls`
+                            );
+                          } else {
+                            // Couldn't parse, send as text
                             safeEnqueue(
                               new TextEncoder().encode(
                                 createOpenAIStreamChunk(
                                   streamId,
                                   openaiBody.model,
-                                  processed
+                                  toolCallBuffer
                                 )
                               )
                             );
-                            console.log(
-                              `   [Debug] Flushed final tool call buffer (${processed.length} chars)`
-                            );
                           }
+                          toolCallBuffer = "";
+                          inToolCall = false;
                         }
+
+                        // Use "tool_calls" finish reason if we emitted any tool calls
+                        const finishReason =
+                          toolCallIndex > 0 ? "tool_calls" : "stop";
 
                         safeEnqueue(
                           new TextEncoder().encode(
@@ -1039,14 +1115,16 @@ const server = Bun.serve({
                               streamId,
                               openaiBody.model,
                               undefined,
-                              "stop"
+                              finishReason as "stop" | "length"
                             )
                           )
                         );
                         safeEnqueue(
                           new TextEncoder().encode("data: [DONE]\n\n")
                         );
-                        logger.verbose(`   [Debug] Sent [DONE] chunk`);
+                        logger.verbose(
+                          `   [Debug] Sent [DONE] chunk with finish_reason: ${finishReason}`
+                        );
                       }
                     } catch (parseError) {
                       // Only log if not cancelled (avoid spam when cancelled)
