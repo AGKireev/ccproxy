@@ -14,6 +14,27 @@ type RequestResult =
   | { success: true; response: Response; source: RequestSource }
   | { success: false; error: string; shouldFallback: boolean };
 
+let rateLimitCache: { resetAt: number } | null = null;
+
+function isRateLimited(): boolean {
+  if (!rateLimitCache) return false;
+  if (Date.now() >= rateLimitCache.resetAt) {
+    rateLimitCache = null;
+    return false;
+  }
+  return true;
+}
+
+function cacheRateLimit(resetAt: number) {
+  rateLimitCache = { resetAt };
+}
+
+function getRateLimitResetMinutes(): number | null {
+  if (!rateLimitCache) return null;
+  const diff = rateLimitCache.resetAt - Date.now();
+  return Math.ceil(diff / 1000 / 60);
+}
+
 /**
  * Prepares the request body for Claude Code:
  * 1. Adds required system prompt prefix for Claude Code identification
@@ -105,6 +126,18 @@ async function makeClaudeCodeRequestWithOAuth(
   body: AnthropicRequest,
   headers: Record<string, string>
 ): Promise<RequestResult> {
+  if (isRateLimited()) {
+    const minutes = getRateLimitResetMinutes();
+    console.log(
+      `Claude Code rate limited (cached), skipping request (resets in ${minutes}m)`
+    );
+    return {
+      success: false,
+      error: "Rate limited (cached)",
+      shouldFallback: true,
+    };
+  }
+
   const token = await getValidToken();
   if (!token) {
     return {
@@ -153,7 +186,36 @@ async function makeClaudeCodeRequestWithOAuth(
     });
 
     if (response.status === 429) {
-      console.log("Claude Code rate limited, will fallback to API key");
+      const retryAfter = response.headers.get("retry-after");
+      const rateLimitReset = response.headers.get("x-ratelimit-reset");
+
+      let resetInfo = "";
+      let resetAt: number | null = null;
+
+      if (retryAfter) {
+        const seconds = parseInt(retryAfter);
+        if (!Number.isNaN(seconds)) {
+          resetAt = Date.now() + seconds * 1000;
+          const minutes = Math.ceil(seconds / 60);
+          resetInfo = ` (resets in ${minutes}m)`;
+        }
+      } else if (rateLimitReset) {
+        const resetTime = new Date(rateLimitReset);
+        if (!Number.isNaN(resetTime.getTime())) {
+          resetAt = resetTime.getTime();
+          const diff = resetAt - Date.now();
+          const minutes = Math.ceil(diff / 1000 / 60);
+          resetInfo = ` (resets in ${minutes}m)`;
+        }
+      }
+
+      if (resetAt) {
+        cacheRateLimit(resetAt);
+      }
+
+      console.log(
+        `Claude Code rate limited, will fallback to API key${resetInfo}`
+      );
       return { success: false, error: "Rate limited", shouldFallback: true };
     }
 
