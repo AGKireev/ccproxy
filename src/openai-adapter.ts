@@ -520,10 +520,83 @@ function trimToFitContext(result: AnthropicRequest): AnthropicRequest {
     tokens = estimateRequestTokens(result);
   }
   if (removed > 0) {
+    // Collect all valid tool_use IDs from remaining assistant messages
+    const validToolUseIds = new Set<string>();
+    for (const msg of result.messages) {
+      if (msg.role === "assistant" && Array.isArray(msg.content)) {
+        for (const block of msg.content) {
+          if (block.type === "tool_use" && block.id) {
+            validToolUseIds.add(block.id);
+          }
+        }
+      }
+    }
+
+    // Remove orphaned tool_result blocks (and drop empty messages)
+    for (let i = result.messages.length - 1; i >= 0; i--) {
+      const msg = result.messages[i];
+      if (msg.role === "user" && Array.isArray(msg.content)) {
+        msg.content = msg.content.filter((block: any) => {
+          if (block.type === "tool_result" && block.tool_use_id) {
+            return validToolUseIds.has(block.tool_use_id);
+          }
+          return true;
+        });
+        if (msg.content.length === 0) {
+          result.messages.splice(i, 1);
+        }
+      }
+    }
+
+    // Collect valid tool_result IDs from remaining user messages
+    const validToolResultIds = new Set<string>();
+    for (const msg of result.messages) {
+      if (msg.role === "user" && Array.isArray(msg.content)) {
+        for (const block of msg.content) {
+          if (block.type === "tool_result" && block.tool_use_id) {
+            validToolResultIds.add(block.tool_use_id);
+          }
+        }
+      }
+    }
+
+    // Remove orphaned tool_use blocks from assistant messages
+    for (let i = result.messages.length - 1; i >= 0; i--) {
+      const msg = result.messages[i];
+      if (msg.role === "assistant" && Array.isArray(msg.content)) {
+        msg.content = msg.content.filter((block: any) => {
+          if (block.type === "tool_use" && block.id) {
+            return validToolResultIds.has(block.id);
+          }
+          return true;
+        });
+        if (msg.content.length === 0) {
+          result.messages.splice(i, 1);
+        }
+      }
+    }
+
+    // Fix broken role alternation: merge consecutive same-role messages
+    for (let i = result.messages.length - 1; i > 0; i--) {
+      if (result.messages[i].role === result.messages[i - 1].role) {
+        // Merge into the earlier message
+        const prev = result.messages[i - 1];
+        const curr = result.messages[i];
+        const toBlocks = (msg: any) => {
+          if (typeof msg.content === "string") return [{ type: "text", text: msg.content }];
+          if (Array.isArray(msg.content)) return msg.content;
+          return [];
+        };
+        prev.content = [...toBlocks(prev), ...toBlocks(curr)];
+        result.messages.splice(i, 1);
+      }
+    }
+
     // Fix alternation: ensure first message is user
     if (result.messages.length > 0 && result.messages[0].role !== "user") {
       result.messages.unshift({ role: "user", content: "Continue." });
     }
+    tokens = estimateRequestTokens(result);
     console.log(`   Step 3 (drop ${removed} middle messages, ${result.messages.length} remaining): ~${Math.round(tokens / 1000)}K tokens`);
   }
 
