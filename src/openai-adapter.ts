@@ -366,22 +366,23 @@ export function openaiToAnthropic(request: OpenAIChatRequest): AnthropicRequest 
   // Pass through tools - Cursor already sends them in Anthropic format
   // (name, description, input_schema) not OpenAI format (type: "function", function: {...})
   if (request.tools && request.tools.length > 0) {
-    // Check if it's OpenAI format (has type: "function") or Anthropic format (has name directly)
-    const firstTool = request.tools[0] as Record<string, unknown>;
-    if (firstTool.type === "function" && firstTool.function) {
-      // OpenAI format - convert to Anthropic
-      result.tools = request.tools.map((tool) => {
-        const t = tool as { type: string; function: { name: string; description?: string; parameters?: Record<string, unknown> } };
+    // Normalize all tool formats to flat Anthropic format: { name, description, input_schema }
+    result.tools = (request.tools as Record<string, unknown>[]).map((tool: any) => {
+      // OpenAI nested format: { type: "function", function: { name, description, parameters } }
+      if (tool.function && tool.function.name) {
         return {
-          name: t.function.name,
-          description: t.function.description || "",
-          input_schema: t.function.parameters || { type: "object", properties: {} },
+          name: tool.function.name,
+          description: tool.function.description || "",
+          input_schema: tool.function.parameters || { type: "object", properties: {} },
         };
-      });
-    } else {
-      // Already Anthropic format - pass through directly
-      result.tools = request.tools as unknown as typeof result.tools;
-    }
+      }
+      // Flat format (Cursor): { type: "function", name, description, parameters/input_schema }
+      return {
+        name: tool.name,
+        description: tool.description || "",
+        input_schema: tool.input_schema || tool.parameters || { type: "object", properties: {} },
+      };
+    }) as unknown as typeof result.tools;
     console.log(`   [Debug] Passing ${request.tools.length} tools to Anthropic`);
   }
   
@@ -395,6 +396,138 @@ export function openaiToAnthropic(request: OpenAIChatRequest): AnthropicRequest 
     result.reasoning_budget = normalized.reasoningBudget;
   }
   
+  return trimToFitContext(result);
+}
+
+/**
+ * Estimate token count for an entire Anthropic request (~4 chars per token)
+ */
+function estimateRequestTokens(req: AnthropicRequest): number {
+  let chars = 0;
+
+  // System prompt
+  if (typeof req.system === "string") {
+    chars += req.system.length;
+  } else if (Array.isArray(req.system)) {
+    for (const block of req.system) {
+      chars += block.text?.length || JSON.stringify(block).length;
+    }
+  }
+
+  // Messages
+  for (const msg of req.messages) {
+    if (typeof msg.content === "string") {
+      chars += msg.content.length;
+    } else if (Array.isArray(msg.content)) {
+      for (const block of msg.content) {
+        if (block.text) chars += block.text.length;
+        else if (typeof block.content === "string") chars += block.content.length;
+        else if (block.input) chars += JSON.stringify(block.input).length;
+        else chars += JSON.stringify(block).length;
+      }
+    }
+  }
+
+  // Tools
+  if (req.tools) {
+    for (const tool of req.tools) {
+      chars += (tool.name?.length || 0) + (tool.description?.length || 0) + JSON.stringify(tool.input_schema || {}).length;
+    }
+  }
+
+  return Math.ceil(chars / 3.2);
+}
+
+/**
+ * Smart context trimming — progressively reduces token count:
+ * 1. Truncate tool descriptions (low value, high token cost)
+ * 2. Truncate large tool_result blocks (file dumps, command output)
+ * 3. Drop old middle messages (keep first 4 + last 20)
+ */
+function trimToFitContext(result: AnthropicRequest): AnthropicRequest {
+  const TOKEN_BUDGET = 190000;
+
+  let tokens = estimateRequestTokens(result);
+  if (tokens <= TOKEN_BUDGET) return result;
+
+  const originalTokens = tokens;
+  console.log(`\n✂️  [Smart Trim] Context too large: ~${Math.round(tokens / 1000)}K tokens (budget: ${TOKEN_BUDGET / 1000}K)`);
+
+  // Step 1: Truncate tool descriptions to 500 chars
+  if (result.tools) {
+    for (const tool of result.tools as any[]) {
+      if (tool.description && tool.description.length > 500) {
+        tool.description = tool.description.slice(0, 497) + "...";
+      }
+    }
+    tokens = estimateRequestTokens(result);
+    console.log(`   Step 1 (trim tool descriptions): ~${Math.round(tokens / 1000)}K tokens`);
+    if (tokens <= TOKEN_BUDGET) {
+      console.log(`   ✓ Trimmed: ${Math.round(originalTokens / 1000)}K → ${Math.round(tokens / 1000)}K tokens`);
+      return result;
+    }
+  }
+
+  // Step 2: Truncate large content blocks (tool results, tool inputs, text blocks)
+  for (const msg of result.messages) {
+    if (Array.isArray(msg.content)) {
+      for (const block of msg.content) {
+        // Trim large tool_result content
+        if (block.type === "tool_result" && typeof block.content === "string" && block.content.length > 2000) {
+          block.content = block.content.slice(0, 1000) + "\n\n...[trimmed for context limit]...\n\n" + block.content.slice(-1000);
+        }
+        // Trim large tool_use input (e.g. file edits with full content)
+        if (block.type === "tool_use" && block.input) {
+          const inputStr = JSON.stringify(block.input);
+          if (inputStr.length > 4000) {
+            // Trim individual string values in the input object
+            const trimmedInput: Record<string, unknown> = {};
+            for (const [key, val] of Object.entries(block.input as Record<string, unknown>)) {
+              if (typeof val === "string" && val.length > 2000) {
+                trimmedInput[key] = val.slice(0, 1000) + "\n...[trimmed]...\n" + val.slice(-1000);
+              } else {
+                trimmedInput[key] = val;
+              }
+            }
+            block.input = trimmedInput;
+          }
+        }
+        // Trim large text blocks (Cursor embeds file contents)
+        if (block.type === "text" && block.text && block.text.length > 8000) {
+          block.text = block.text.slice(0, 4000) + "\n\n...[trimmed for context limit]...\n\n" + block.text.slice(-4000);
+        }
+      }
+    }
+    // Trim large string content messages
+    if (typeof msg.content === "string" && msg.content.length > 8000) {
+      msg.content = msg.content.slice(0, 4000) + "\n\n...[trimmed for context limit]...\n\n" + msg.content.slice(-4000);
+    }
+  }
+  tokens = estimateRequestTokens(result);
+  console.log(`   Step 2 (trim large content blocks): ~${Math.round(tokens / 1000)}K tokens`);
+  if (tokens <= TOKEN_BUDGET) {
+    console.log(`   ✓ Trimmed: ${Math.round(originalTokens / 1000)}K → ${Math.round(tokens / 1000)}K tokens`);
+    return result;
+  }
+
+  // Step 3: Progressively drop oldest middle messages (keep first 4, remove from position 4 onward)
+  const keepStart = 4;
+  let removed = 0;
+  while (tokens > TOKEN_BUDGET && result.messages.length > keepStart + 4) {
+    // Remove 2 messages at a time from just after the kept start (to maintain alternation)
+    result.messages.splice(keepStart, 2);
+    removed += 2;
+    tokens = estimateRequestTokens(result);
+  }
+  if (removed > 0) {
+    // Fix alternation: ensure first message is user
+    if (result.messages.length > 0 && result.messages[0].role !== "user") {
+      result.messages.unshift({ role: "user", content: "Continue." });
+    }
+    console.log(`   Step 3 (drop ${removed} middle messages, ${result.messages.length} remaining): ~${Math.round(tokens / 1000)}K tokens`);
+  }
+
+  console.log(`   ✓ Trimmed: ${Math.round(originalTokens / 1000)}K → ${Math.round(tokens / 1000)}K tokens`);
   return result;
 }
 
@@ -633,17 +766,5 @@ export function parseXMLToolCalls(text: string): ParsedToolCall[] {
   }
   
   return toolCalls;
-}
-
-/**
- * Check if text contains XML tool calls
- */
-export function hasXMLToolCalls(text: string): boolean {
-  return (
-    /<invoke\s+name=/i.test(text) ||
-    /<search_files>/i.test(text) ||
-    /<read_file>/i.test(text) ||
-    /<grep>/i.test(text)
-  );
 }
 

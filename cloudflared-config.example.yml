@@ -1,0 +1,33 @@
+# Cloudflare Named Tunnel Configuration
+#
+# Setup steps:
+#   1. Create free Cloudflare account at https://dash.cloudflare.com
+#   2. Add your domain to Cloudflare (or use a new one)
+#   3. Install cloudflared: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/
+#   4. Run: cloudflared tunnel login
+#   5. Run: cloudflared tunnel create ccproxy
+#   6. Run: cloudflared tunnel route dns ccproxy ccproxy.yourdomain.com
+#   7. Copy this file to cloudflared-config.yml and fill in your values
+#   8. Run: cloudflared tunnel --config ./cloudflared-config.yml run
+#
+# Replace these with your actual values:
+tunnel: YOUR_TUNNEL_UUID
+credentials-file: /path/to/your/tunnel-credentials.json
+
+# Retry and resilience settings
+retries: 5
+grace-period: 60s
+protocol: auto
+
+ingress:
+  - hostname: ccproxy.yourdomain.com
+    service: http://localhost:8082
+    originRequest:
+      # Keep connections alive for long LLM streaming responses
+      keepAliveTimeout: 120s
+      keepAliveConnections: 100
+      tcpKeepAlive: 30s
+      connectTimeout: 30s
+      # Don't disable chunked encoding - needed for SSE streaming
+      disableChunkedEncoding: false
+  - service: http_status:404

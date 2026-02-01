@@ -287,7 +287,13 @@ const server = Bun.serve({
     if (url.pathname === "/v1/chat/completions" && req.method === "POST") {
       try {
         logRequestDetails(req, "OpenAI /v1/chat/completions");
-        const openaiBody = (await req.json()) as OpenAIChatRequest;
+        const openaiBody = (await req.json()) as OpenAIChatRequest & { input?: unknown[] };
+
+        // Normalize OpenAI Responses API format ("input") to Chat Completions format ("messages")
+        if (!openaiBody.messages && Array.isArray(openaiBody.input)) {
+          openaiBody.messages = openaiBody.input as OpenAIChatRequest["messages"];
+          delete openaiBody.input;
+        }
 
         // Log the request body from Cursor (truncated)
         const bodyStr = JSON.stringify(openaiBody, null, 2);
@@ -318,9 +324,11 @@ const server = Bun.serve({
           logger.verbose(`\n📝 [Cursor Messages]:`);
           openaiBody.messages.forEach((msg, idx) => {
             const content =
-              typeof msg.content === "string"
-                ? msg.content
-                : JSON.stringify(msg.content);
+              msg.content == null
+                ? ""
+                : typeof msg.content === "string"
+                  ? msg.content
+                  : JSON.stringify(msg.content);
 
             // For system messages, log the full content (might contain tool call format instructions)
             if (msg.role === "system") {
@@ -526,6 +534,7 @@ const server = Bun.serve({
           }
 
           let cancelled = false;
+          let totalCharsSent = 0; // Track how much content we've actually sent to client
           const stream = new ReadableStream({
             async start(controller) {
               const decoder = new TextDecoder();
@@ -535,7 +544,7 @@ const server = Bun.serve({
               let inToolCall = false;
               let lastChunkTime = Date.now();
               const HEARTBEAT_INTERVAL = 5000; // Send heartbeat every 5 seconds if buffering
-              let currentBlockIndex = -1; // Track which content block we're processing
+              const KEEPALIVE_INTERVAL = 25000; // Send keepalive every 25s to prevent tunnel idle timeout
               let blockTextSent = false; // Track if we've sent text from content_block_start
               let toolCallIndex = 0; // Track tool call index for OpenAI format
               let currentToolCall: {
@@ -544,11 +553,29 @@ const server = Bun.serve({
                 inputJson: string;
               } | null = null; // Current tool_use block being streamed
 
+              // Keepalive timer to prevent Cloudflare tunnel idle timeout (60s hard limit on HTTP/2)
+              // Sends SSE comment every 25s during silent periods (e.g. extended thinking)
+              let lastActivityTime = Date.now();
+              const keepaliveTimer = setInterval(() => {
+                if (cancelled) return;
+                const silentMs = Date.now() - lastActivityTime;
+                if (silentMs >= KEEPALIVE_INTERVAL) {
+                  try {
+                    controller.enqueue(new TextEncoder().encode(": keepalive\n\n"));
+                    logger.verbose(`   [Debug] Sent keepalive after ${Math.round(silentMs / 1000)}s silence`);
+                  } catch {
+                    // Controller closed, will be cleaned up
+                  }
+                }
+              }, KEEPALIVE_INTERVAL);
+
               // Helper to safely enqueue data
               const safeEnqueue = (data: Uint8Array) => {
                 try {
                   if (!cancelled) {
                     controller.enqueue(data);
+                    lastActivityTime = Date.now();
+                    totalCharsSent += data.length;
                   }
                 } catch {
                   // Controller might be closed, ignore
@@ -644,7 +671,6 @@ const server = Bun.serve({
                         );
 
                         // Handle text blocks that might contain tool calls (complete blocks, not streaming)
-                        currentBlockIndex = event.index ?? currentBlockIndex;
                         blockTextSent = false;
 
                         if (block?.type === "text" && block.text) {
@@ -691,33 +717,35 @@ const server = Bun.serve({
                           `   [Debug] content_block_stop for index ${event.index}`
                         );
 
-                        // If we were building a tool call, send the final arguments chunk
+                        // If we were building a tool call, finalize it
                         if (currentToolCall) {
                           logger.verbose(
                             `   [Debug] Finalizing tool call: ${currentToolCall.name} with args: ${currentToolCall.inputJson}`
                           );
 
-                          // Send the arguments chunk
-                          safeEnqueue(
-                            new TextEncoder().encode(
-                              createOpenAIToolCallChunk(
-                                streamId,
-                                openaiBody.model,
-                                toolCallIndex,
-                                undefined,
-                                undefined,
-                                currentToolCall.inputJson || "{}",
-                                null
+                          // Arguments were already streamed via input_json_delta
+                          // Only send empty args if nothing was accumulated
+                          if (!currentToolCall.inputJson) {
+                            safeEnqueue(
+                              new TextEncoder().encode(
+                                createOpenAIToolCallChunk(
+                                  streamId,
+                                  openaiBody.model,
+                                  toolCallIndex,
+                                  undefined,
+                                  undefined,
+                                  "{}",
+                                  null
+                                )
                               )
-                            )
-                          );
+                            );
+                          }
 
                           toolCallIndex++;
                           currentToolCall = null;
                         }
 
                         blockTextSent = false;
-                        currentBlockIndex = -1;
                       }
 
                       // Handle input_json_delta for tool_use blocks
@@ -731,7 +759,22 @@ const server = Bun.serve({
                         logger.verbose(
                           `   [Debug] input_json_delta: "${jsonChunk}" (total: ${currentToolCall.inputJson.length} chars)`
                         );
-                        // Don't send anything yet - accumulate until content_block_stop
+                        // Stream each fragment to client immediately (matches OpenAI behavior)
+                        if (jsonChunk) {
+                          safeEnqueue(
+                            new TextEncoder().encode(
+                              createOpenAIToolCallChunk(
+                                streamId,
+                                openaiBody.model,
+                                toolCallIndex,
+                                undefined,
+                                undefined,
+                                jsonChunk,
+                                null
+                              )
+                            )
+                          );
+                        }
                         continue;
                       }
 
@@ -1150,6 +1193,9 @@ const server = Bun.serve({
                   }
                 }
               } finally {
+                // Stop keepalive timer
+                clearInterval(keepaliveTimer);
+
                 // Cancel upstream reader if still active
                 try {
                   if (!cancelled) {
@@ -1173,7 +1219,7 @@ const server = Bun.serve({
             },
             cancel(reason) {
               logger.verbose(
-                `   [Debug] Stream cancelled by client: ${reason}`
+                `   [Debug] Stream cancelled by client: ${reason} (sent ${totalCharsSent} chars so far)`
               );
               cancelled = true;
               // Cancel the upstream reader
