@@ -6,6 +6,7 @@
 import type { AnthropicRequest, AnthropicMessage, ContentBlock } from "./types";
 import { translateToolCalls, needsTranslation } from "./tool-call-translator";
 import { logger } from "./logger";
+import { getConfig } from "./config";
 
 export interface OpenAIMessage {
   role: "system" | "user" | "assistant" | "tool";
@@ -345,7 +346,7 @@ export function openaiToAnthropic(request: OpenAIChatRequest): AnthropicRequest 
     ? "Cursor (max_completion_tokens)" 
     : "Default (4096)";
   
-  console.log(`   [Debug] Normalized model: "${request.model}" → "${normalized.model}"${normalized.reasoningBudget ? ` (reasoning_budget: ${normalized.reasoningBudget})` : ""}`);
+  console.log(`   [Debug] Normalized model: "${request.model}" → "${normalized.model}"${normalized.reasoningBudget ? ` (thinking: ${normalized.reasoningBudget})` : ""}`);
   console.log(`   [Debug] Max tokens: ${maxTokens} (${maxTokensSource})`);
 
   const result: AnthropicRequest = {
@@ -391,218 +392,52 @@ export function openaiToAnthropic(request: OpenAIChatRequest): AnthropicRequest 
     result.tool_choice = request.tool_choice as unknown as typeof result.tool_choice;
   }
   
-  // Add reasoning_budget if present (Anthropic expects it as a number or specific string)
+  // Add extended thinking if reasoning budget is specified
   if (normalized.reasoningBudget) {
-    result.reasoning_budget = normalized.reasoningBudget;
+    const config = getConfig();
+
+    // Ensure max_tokens is large enough for thinking (Cursor often sends 4096)
+    const MIN_THINKING_MAX_TOKENS = 64000; // All 4.5 models cap at 64K output
+    if (result.max_tokens < MIN_THINKING_MAX_TOKENS) {
+      console.log(`   [Debug] Bumping max_tokens from ${result.max_tokens} to ${MIN_THINKING_MAX_TOKENS} for extended thinking`);
+      result.max_tokens = MIN_THINKING_MAX_TOKENS;
+    }
+
+    const budgetMap: Record<string, string | number> = {
+      high: config.thinkingBudgetHigh,
+      medium: config.thinkingBudgetMedium,
+      low: config.thinkingBudgetLow,
+    };
+    const raw = budgetMap[normalized.reasoningBudget] ?? config.thinkingBudgetHigh;
+    const budgetTokens = raw === "max" ? result.max_tokens - 1 : Number(raw);
+    result.thinking = { type: "enabled", budget_tokens: budgetTokens };
+
+    // Anthropic constraints when thinking is enabled:
+    // - temperature must be unset (defaults to 1)
+    // - top_k is not compatible
+    // - top_p must be 0.95-1 (safest to remove)
+    delete result.temperature;
+    delete result.top_k;
+    delete result.top_p;
+
+    // tool_choice: only "auto" or "none" allowed with thinking
+    if (result.tool_choice && result.tool_choice.type !== "auto" && result.tool_choice.type !== "none") {
+      console.log(`   [Debug] Forcing tool_choice from "${result.tool_choice.type}" to "auto" (thinking constraint)`);
+      result.tool_choice = { type: "auto" };
+    }
+
+    // Streaming required when max_tokens > 21,333
+    if (result.max_tokens > 21333 && !result.stream) {
+      console.log(`   [Debug] Forcing stream=true (required for max_tokens=${result.max_tokens} with thinking)`);
+      result.stream = true;
+    }
+
+    console.log(`   [Debug] Extended thinking: budget_tokens=${budgetTokens}, max_tokens=${result.max_tokens}`);
   }
   
-  return trimToFitContext(result);
-}
-
-/**
- * Estimate token count for an entire Anthropic request (~4 chars per token)
- */
-function estimateRequestTokens(req: AnthropicRequest): number {
-  let chars = 0;
-
-  // System prompt
-  if (typeof req.system === "string") {
-    chars += req.system.length;
-  } else if (Array.isArray(req.system)) {
-    for (const block of req.system) {
-      chars += block.text?.length || JSON.stringify(block).length;
-    }
-  }
-
-  // Messages
-  for (const msg of req.messages) {
-    if (typeof msg.content === "string") {
-      chars += msg.content.length;
-    } else if (Array.isArray(msg.content)) {
-      for (const block of msg.content) {
-        if (block.text) chars += block.text.length;
-        else if (typeof block.content === "string") chars += block.content.length;
-        else if (block.input) chars += JSON.stringify(block.input).length;
-        else chars += JSON.stringify(block).length;
-      }
-    }
-  }
-
-  // Tools
-  if (req.tools) {
-    for (const tool of req.tools) {
-      chars += (tool.name?.length || 0) + (tool.description?.length || 0) + JSON.stringify(tool.input_schema || {}).length;
-    }
-  }
-
-  return Math.ceil(chars / 3.2);
-}
-
-/**
- * Smart context trimming — progressively reduces token count:
- * 1. Truncate tool descriptions (low value, high token cost)
- * 2. Truncate large tool_result blocks (file dumps, command output)
- * 3. Drop old middle messages (keep first 4 + last 20)
- */
-function trimToFitContext(result: AnthropicRequest): AnthropicRequest {
-  const TOKEN_BUDGET = 190000;
-
-  let tokens = estimateRequestTokens(result);
-  if (tokens <= TOKEN_BUDGET) return result;
-
-  const originalTokens = tokens;
-  console.log(`\n✂️  [Smart Trim] Context too large: ~${Math.round(tokens / 1000)}K tokens (budget: ${TOKEN_BUDGET / 1000}K)`);
-
-  // Step 1: Truncate tool descriptions to 500 chars
-  if (result.tools) {
-    for (const tool of result.tools as any[]) {
-      if (tool.description && tool.description.length > 500) {
-        tool.description = tool.description.slice(0, 497) + "...";
-      }
-    }
-    tokens = estimateRequestTokens(result);
-    console.log(`   Step 1 (trim tool descriptions): ~${Math.round(tokens / 1000)}K tokens`);
-    if (tokens <= TOKEN_BUDGET) {
-      console.log(`   ✓ Trimmed: ${Math.round(originalTokens / 1000)}K → ${Math.round(tokens / 1000)}K tokens`);
-      return result;
-    }
-  }
-
-  // Step 2: Truncate large content blocks (tool results, tool inputs, text blocks)
-  for (const msg of result.messages) {
-    if (Array.isArray(msg.content)) {
-      for (const block of msg.content) {
-        // Trim large tool_result content
-        if (block.type === "tool_result" && typeof block.content === "string" && block.content.length > 2000) {
-          block.content = block.content.slice(0, 1000) + "\n\n...[trimmed for context limit]...\n\n" + block.content.slice(-1000);
-        }
-        // Trim large tool_use input (e.g. file edits with full content)
-        if (block.type === "tool_use" && block.input) {
-          const inputStr = JSON.stringify(block.input);
-          if (inputStr.length > 4000) {
-            // Trim individual string values in the input object
-            const trimmedInput: Record<string, unknown> = {};
-            for (const [key, val] of Object.entries(block.input as Record<string, unknown>)) {
-              if (typeof val === "string" && val.length > 2000) {
-                trimmedInput[key] = val.slice(0, 1000) + "\n...[trimmed]...\n" + val.slice(-1000);
-              } else {
-                trimmedInput[key] = val;
-              }
-            }
-            block.input = trimmedInput;
-          }
-        }
-        // Trim large text blocks (Cursor embeds file contents)
-        if (block.type === "text" && block.text && block.text.length > 8000) {
-          block.text = block.text.slice(0, 4000) + "\n\n...[trimmed for context limit]...\n\n" + block.text.slice(-4000);
-        }
-      }
-    }
-    // Trim large string content messages
-    if (typeof msg.content === "string" && msg.content.length > 8000) {
-      msg.content = msg.content.slice(0, 4000) + "\n\n...[trimmed for context limit]...\n\n" + msg.content.slice(-4000);
-    }
-  }
-  tokens = estimateRequestTokens(result);
-  console.log(`   Step 2 (trim large content blocks): ~${Math.round(tokens / 1000)}K tokens`);
-  if (tokens <= TOKEN_BUDGET) {
-    console.log(`   ✓ Trimmed: ${Math.round(originalTokens / 1000)}K → ${Math.round(tokens / 1000)}K tokens`);
-    return result;
-  }
-
-  // Step 3: Progressively drop oldest middle messages (keep first 4, remove from position 4 onward)
-  const keepStart = 4;
-  let removed = 0;
-  while (tokens > TOKEN_BUDGET && result.messages.length > keepStart + 4) {
-    // Remove 2 messages at a time from just after the kept start (to maintain alternation)
-    result.messages.splice(keepStart, 2);
-    removed += 2;
-    tokens = estimateRequestTokens(result);
-  }
-  if (removed > 0) {
-    // Collect all valid tool_use IDs from remaining assistant messages
-    const validToolUseIds = new Set<string>();
-    for (const msg of result.messages) {
-      if (msg.role === "assistant" && Array.isArray(msg.content)) {
-        for (const block of msg.content) {
-          if (block.type === "tool_use" && block.id) {
-            validToolUseIds.add(block.id);
-          }
-        }
-      }
-    }
-
-    // Remove orphaned tool_result blocks (and drop empty messages)
-    for (let i = result.messages.length - 1; i >= 0; i--) {
-      const msg = result.messages[i];
-      if (msg.role === "user" && Array.isArray(msg.content)) {
-        msg.content = msg.content.filter((block: any) => {
-          if (block.type === "tool_result" && block.tool_use_id) {
-            return validToolUseIds.has(block.tool_use_id);
-          }
-          return true;
-        });
-        if (msg.content.length === 0) {
-          result.messages.splice(i, 1);
-        }
-      }
-    }
-
-    // Collect valid tool_result IDs from remaining user messages
-    const validToolResultIds = new Set<string>();
-    for (const msg of result.messages) {
-      if (msg.role === "user" && Array.isArray(msg.content)) {
-        for (const block of msg.content) {
-          if (block.type === "tool_result" && block.tool_use_id) {
-            validToolResultIds.add(block.tool_use_id);
-          }
-        }
-      }
-    }
-
-    // Remove orphaned tool_use blocks from assistant messages
-    for (let i = result.messages.length - 1; i >= 0; i--) {
-      const msg = result.messages[i];
-      if (msg.role === "assistant" && Array.isArray(msg.content)) {
-        msg.content = msg.content.filter((block: any) => {
-          if (block.type === "tool_use" && block.id) {
-            return validToolResultIds.has(block.id);
-          }
-          return true;
-        });
-        if (msg.content.length === 0) {
-          result.messages.splice(i, 1);
-        }
-      }
-    }
-
-    // Fix broken role alternation: merge consecutive same-role messages
-    for (let i = result.messages.length - 1; i > 0; i--) {
-      if (result.messages[i].role === result.messages[i - 1].role) {
-        // Merge into the earlier message
-        const prev = result.messages[i - 1];
-        const curr = result.messages[i];
-        const toBlocks = (msg: any) => {
-          if (typeof msg.content === "string") return [{ type: "text", text: msg.content }];
-          if (Array.isArray(msg.content)) return msg.content;
-          return [];
-        };
-        prev.content = [...toBlocks(prev), ...toBlocks(curr)];
-        result.messages.splice(i, 1);
-      }
-    }
-
-    // Fix alternation: ensure first message is user
-    if (result.messages.length > 0 && result.messages[0].role !== "user") {
-      result.messages.unshift({ role: "user", content: "Continue." });
-    }
-    tokens = estimateRequestTokens(result);
-    console.log(`   Step 3 (drop ${removed} middle messages, ${result.messages.length} remaining): ~${Math.round(tokens / 1000)}K tokens`);
-  }
-
-  console.log(`   ✓ Trimmed: ${Math.round(originalTokens / 1000)}K → ${Math.round(tokens / 1000)}K tokens`);
   return result;
 }
+
 
 export function anthropicToOpenai(
   anthropicResponse: any,

@@ -8,8 +8,78 @@ import type {
   TokenInfo,
   TokenRefreshResponse,
 } from "./types";
+import { openSync, closeSync, unlinkSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 
 let cachedToken: TokenInfo | null = null;
+
+// In-process mutex to prevent concurrent refreshes from parallel requests
+let refreshInProgress: Promise<TokenInfo | null> | null = null;
+
+// --- File locking ---
+// Uses a .lock file with O_CREAT|O_EXCL for atomic creation (works cross-platform).
+// If a lock is stale (>30s old), we force-remove it.
+
+const LOCK_FILE = CLAUDE_CREDENTIALS_PATH + ".lock";
+const LOCK_TIMEOUT_MS = 30_000; // stale lock threshold
+const LOCK_RETRY_MS = 100;
+const LOCK_MAX_RETRIES = 50; // 5s total wait
+
+function acquireLock(): boolean {
+  // Check for stale lock
+  if (existsSync(LOCK_FILE)) {
+    try {
+      const lockContent = readFileSync(LOCK_FILE, "utf-8");
+      const lockTime = parseInt(lockContent, 10);
+      if (!isNaN(lockTime) && Date.now() - lockTime > LOCK_TIMEOUT_MS) {
+        console.log("⚠ Removing stale credentials lock file");
+        try { unlinkSync(LOCK_FILE); } catch {}
+      }
+    } catch {
+      // Can't read lock file — try to remove it
+      try { unlinkSync(LOCK_FILE); } catch {}
+    }
+  }
+
+  try {
+    // O_CREAT | O_EXCL = atomic create, fails if file exists
+    const fd = openSync(LOCK_FILE, "wx");
+    closeSync(fd);
+    // Write timestamp for stale detection (after closing the exclusive fd)
+    writeFileSync(LOCK_FILE, String(Date.now()));
+    return true;
+  } catch {
+    return false; // lock held by another process
+  }
+}
+
+function releaseLock(): void {
+  try {
+    unlinkSync(LOCK_FILE);
+  } catch {}
+}
+
+async function withFileLock<T>(fn: () => Promise<T>): Promise<T> {
+  let acquired = false;
+  let retries = 0;
+  while (!(acquired = acquireLock())) {
+    retries++;
+    if (retries >= LOCK_MAX_RETRIES) {
+      console.error("⚠ Could not acquire credentials lock after 5s, proceeding without lock");
+      break;
+    }
+    await new Promise((r) => setTimeout(r, LOCK_RETRY_MS));
+  }
+
+  try {
+    return await fn();
+  } finally {
+    if (acquired) {
+      releaseLock();
+    }
+  }
+}
+
+// --- Credential loading ---
 
 async function loadFromKeychain(): Promise<ClaudeCredentials | null> {
   try {
@@ -54,6 +124,34 @@ async function loadFromFile(): Promise<ClaudeCredentials | null> {
   }
 }
 
+/**
+ * Save credentials back to the file after a successful token refresh.
+ * Reads the existing file first to preserve any extra fields, then
+ * updates only the OAuth token fields.
+ * MUST be called within withFileLock.
+ */
+async function saveCredentials(tokenInfo: TokenInfo): Promise<void> {
+  try {
+    let existing: any = {};
+    const file = Bun.file(CLAUDE_CREDENTIALS_PATH);
+    if (await file.exists()) {
+      existing = await file.json();
+    }
+
+    existing.claudeAiOauth = {
+      ...existing.claudeAiOauth,
+      accessToken: tokenInfo.accessToken,
+      refreshToken: tokenInfo.refreshToken,
+      expiresAt: tokenInfo.expiresAt,
+    };
+
+    await Bun.write(CLAUDE_CREDENTIALS_PATH, JSON.stringify(existing));
+    console.log("✓ Credentials saved to file");
+  } catch (error) {
+    console.error("Failed to save credentials:", error);
+  }
+}
+
 export async function loadCredentials(): Promise<ClaudeCredentials | null> {
   // Try Keychain first (macOS), then file fallback
   const keychainCreds = await loadFromKeychain();
@@ -80,48 +178,99 @@ export function isTokenExpired(expiresAt: number): boolean {
   return Date.now() >= expiresAt - bufferMs;
 }
 
+/**
+ * Core refresh logic — called within file lock and in-process mutex.
+ */
+async function doRefreshToken(
+  refreshTokenValue: string
+): Promise<TokenInfo | null> {
+  // Re-read credentials fresh from file (inside lock),
+  // in case another process just refreshed
+  const freshCreds = await loadFromFile();
+  if (freshCreds?.claudeAiOauth) {
+    const fresh = freshCreds.claudeAiOauth;
+    // If the file has a newer, non-expired token, use it directly
+    if (!isTokenExpired(fresh.expiresAt)) {
+      console.log("✓ Found fresh token in credentials file (updated by another process)");
+      const tokenInfo: TokenInfo = {
+        accessToken: fresh.accessToken,
+        refreshToken: fresh.refreshToken,
+        expiresAt: fresh.expiresAt,
+        isExpired: false,
+      };
+      cachedToken = tokenInfo;
+      return tokenInfo;
+    }
+    // If the file has a different refresh token, use that instead
+    if (fresh.refreshToken !== refreshTokenValue) {
+      console.log("✓ Using updated refresh token from credentials file");
+      refreshTokenValue = fresh.refreshToken;
+    }
+  }
+
+  console.log("Refreshing OAuth token...");
+
+  const response = await fetch(ANTHROPIC_TOKEN_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token: refreshTokenValue,
+      client_id: CLAUDE_CLIENT_ID,
+    }),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    console.error("Token refresh failed:", response.status, errorText);
+    return null;
+  }
+
+  const data: TokenRefreshResponse = await response.json();
+  const expiresAt = Date.now() + data.expires_in * 1000;
+
+  const tokenInfo: TokenInfo = {
+    accessToken: data.access_token,
+    refreshToken: data.refresh_token,
+    expiresAt,
+    isExpired: false,
+  };
+
+  cachedToken = tokenInfo;
+
+  // Persist the new tokens back to the credentials file
+  await saveCredentials(tokenInfo);
+
+  console.log("✓ Token refreshed successfully");
+  return tokenInfo;
+}
+
+/**
+ * Refresh the OAuth token with:
+ * 1. In-process mutex (prevents concurrent refreshes from parallel requests)
+ * 2. File lock (prevents races with Claude CLI or other processes)
+ */
 export async function refreshToken(
   refreshTokenValue: string
 ): Promise<TokenInfo | null> {
-  try {
-    console.log("Refreshing OAuth token...");
+  // If a refresh is already in progress in this process, wait for it
+  if (refreshInProgress) {
+    console.log("Token refresh already in progress, waiting...");
+    return refreshInProgress;
+  }
 
-    const response = await fetch(ANTHROPIC_TOKEN_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-      },
-      body: new URLSearchParams({
-        grant_type: "refresh_token",
-        refresh_token: refreshTokenValue,
-        client_id: CLAUDE_CLIENT_ID,
-      }),
+  refreshInProgress = withFileLock(() => doRefreshToken(refreshTokenValue))
+    .catch((error) => {
+      console.error("Failed to refresh token:", error);
+      return null;
+    })
+    .finally(() => {
+      refreshInProgress = null;
     });
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error("Token refresh failed:", response.status, errorText);
-      return null;
-    }
-
-    const data: TokenRefreshResponse = await response.json();
-    const expiresAt = Date.now() + data.expires_in * 1000;
-
-    const tokenInfo: TokenInfo = {
-      accessToken: data.access_token,
-      refreshToken: data.refresh_token,
-      expiresAt,
-      isExpired: false,
-    };
-
-    cachedToken = tokenInfo;
-
-    console.log("Token refreshed successfully");
-    return tokenInfo;
-  } catch (error) {
-    console.error("Failed to refresh token:", error);
-    return null;
-  }
+  return refreshInProgress;
 }
 
 export async function getValidToken(): Promise<TokenInfo | null> {

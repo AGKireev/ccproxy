@@ -1,6 +1,7 @@
 import { getConfig, CLAUDE_CREDENTIALS_PATH } from "./src/config";
 import { loadCredentials, getValidToken } from "./src/oauth";
 import { proxyRequest } from "./src/anthropic-client";
+import { manageContext } from "./src/context-manager";
 import {
   openaiToAnthropic,
   anthropicToOpenai,
@@ -257,9 +258,10 @@ const server = Bun.serve({
           } | max_tokens=${body.max_tokens}`
         );
 
+        const managedBody = await manageContext(body);
         const response = await proxyRequest(
           "/v1/messages",
-          body,
+          managedBody,
           headers,
           userAPIKey || undefined
         );
@@ -478,9 +480,10 @@ const server = Bun.serve({
           );
         }
 
+        const managedBody = await manageContext(anthropicBody);
         const response = await proxyRequest(
           "/v1/messages",
-          anthropicBody,
+          managedBody,
           headers,
           userAPIKey || undefined
         );
@@ -513,7 +516,7 @@ const server = Bun.serve({
         responseHeaders.set("Content-Type", "application/json");
 
         // Handle streaming
-        if (anthropicBody.stream && response.ok) {
+        if (managedBody.stream && response.ok) {
           responseHeaders.set("Content-Type", "text/event-stream");
           responseHeaders.set("Cache-Control", "no-cache");
           responseHeaders.set("Connection", "keep-alive");
@@ -681,6 +684,12 @@ const server = Bun.serve({
                           // Text blocks are handled in content_block_delta
                         }
 
+                        // Skip thinking blocks (not forwarded to Cursor)
+                        if (block?.type === "thinking" || block?.type === "redacted_thinking") {
+                          console.log(`   [Debug] ${block.type} block started (not forwarded to client)`);
+                          continue;
+                        }
+
                         // Handle tool_use blocks - Anthropic's native tool call format
                         if (block?.type === "tool_use") {
                           logger.verbose(
@@ -775,6 +784,25 @@ const server = Bun.serve({
                             )
                           );
                         }
+                        continue;
+                      }
+
+                      // Handle thinking_delta events (log only, not sent to Cursor)
+                      if (
+                        event.type === "content_block_delta" &&
+                        event.delta?.type === "thinking_delta"
+                      ) {
+                        logger.verbose(
+                          `   [Thinking] ${event.delta.thinking?.slice(0, 200) || ""}`
+                        );
+                        continue;
+                      }
+
+                      // Handle signature_delta events (skip silently)
+                      if (
+                        event.type === "content_block_delta" &&
+                        event.delta?.type === "signature_delta"
+                      ) {
                         continue;
                       }
 
@@ -1428,4 +1456,8 @@ if (isOpenAIPassthroughEnabled()) {
 console.log("\n📋 Usage in Cursor/other clients:");
 console.log(`   API Base URL: http://localhost:${server.port}`);
 console.log("   API Key: (any value, e.g. 'proxy')");
-console.log(`\n📝 Verbose logging enabled → api.log (gitignored)\n`);
+if (process.env.VERBOSE_LOGGING === "true") {
+  console.log(`\n📝 Verbose file logging enabled → api.log (gitignored)\n`);
+} else {
+  console.log(`\n📝 Verbose file logging disabled (set VERBOSE_LOGGING=true to enable)\n`);
+}

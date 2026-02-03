@@ -44,14 +44,9 @@ function getRateLimitResetMinutes(): number | null {
 function prepareClaudeCodeBody(body: AnthropicRequest): AnthropicRequest {
   const prepared = { ...body };
 
-  // Claude Code API doesn't support reasoning_budget - remove it
-  // This must be removed before sending to Claude Code to avoid errors
+  // Remove legacy reasoning_budget (replaced by thinking block)
   if ("reasoning_budget" in prepared) {
-    const budgetValue = prepared.reasoning_budget;
     delete prepared.reasoning_budget;
-    logger.verbose(
-      `   [Debug] Removed reasoning_budget (${budgetValue}) - not supported by Claude Code API`
-    );
   }
 
   // Build system prompts array - required Claude Code prompt first
@@ -286,12 +281,9 @@ async function makeDirectApiRequest(
   apiKey: string
 ): Promise<RequestResult> {
   try {
-    // Remove reasoning_budget - direct API may not support it in all contexts
     const preparedBody = { ...body };
+    // Remove legacy reasoning_budget (replaced by thinking block)
     if ("reasoning_budget" in preparedBody) {
-      logger.verbose(
-        `   [Debug] Removing reasoning_budget (${preparedBody.reasoning_budget}) from direct API request`
-      );
       delete preparedBody.reasoning_budget;
     }
 

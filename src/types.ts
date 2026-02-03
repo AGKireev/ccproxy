@@ -60,6 +60,10 @@ export interface AnthropicRequest {
   tools?: Tool[];
   tool_choice?: ToolChoice;
   reasoning_budget?: number | string;
+  thinking?: {
+    type: "enabled";
+    budget_tokens: number;
+  };
 }
 
 export interface Tool {
@@ -102,4 +106,11 @@ export interface ProxyConfig {
   openaiApiKey?: string;
   openaiBaseUrl: string;
   allowedIPs: string[];
+  contextStrategy: "summarize" | "trim" | "none";
+  contextSummarizationModel: string;
+  contextMaxTokens: number;
+  contextTargetTokens: number;
+  thinkingBudgetHigh: string;
+  thinkingBudgetMedium: number;
+  thinkingBudgetLow: number;
 }

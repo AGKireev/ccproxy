@@ -8,7 +8,7 @@ export const CLAUDE_CREDENTIALS_PATH = join(
   ".credentials.json"
 );
 export const CLAUDE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
-export const ANTHROPIC_TOKEN_URL = "https://console.anthropic.com/oauth/token";
+export const ANTHROPIC_TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
 export const ANTHROPIC_API_URL = "https://api.anthropic.com";
 // Required beta headers for Claude Code OAuth
 export const ANTHROPIC_BETA_OAUTH = "oauth-2025-04-20";
@@ -18,6 +18,7 @@ export const ANTHROPIC_BETA_CLAUDE_CODE = "claude-code-20250219";
 export const CLAUDE_CODE_BETA_HEADERS = [
   ANTHROPIC_BETA_CLAUDE_CODE,
   ANTHROPIC_BETA_OAUTH,
+  "interleaved-thinking-2025-05-14",
 ].join(",");
 
 // System prompt prefix that identifies requests as coming from Claude Code
@@ -46,5 +47,12 @@ export function getConfig(): ProxyConfig {
     openaiApiKey: process.env.OPENAI_API_KEY,
     openaiBaseUrl: process.env.OPENAI_BASE_URL || "https://api.openai.com",
     allowedIPs,
+    contextStrategy: (process.env.CONTEXT_STRATEGY as "summarize" | "trim" | "none") || "summarize",
+    contextSummarizationModel: process.env.CONTEXT_SUMMARIZATION_MODEL || "claude-opus-4-5",
+    contextMaxTokens: parseInt(process.env.CONTEXT_MAX_TOKENS || "200000"),
+    contextTargetTokens: parseInt(process.env.CONTEXT_TARGET_TOKENS || "180000"),
+    thinkingBudgetHigh: process.env.THINKING_BUDGET_HIGH || "max",
+    thinkingBudgetMedium: parseInt(process.env.THINKING_BUDGET_MEDIUM || "20000"),
+    thinkingBudgetLow: parseInt(process.env.THINKING_BUDGET_LOW || "5000"),
   };
 }

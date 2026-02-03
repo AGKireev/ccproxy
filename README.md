@@ -15,7 +15,9 @@ bun install && bun run index.ts
 
 Proxy runs on `http://localhost:8082`. Use `http://localhost:8082/v1` as your base URL.
 
-**Windows users**: A `start-proxy.bat` launcher template is referenced in this repo. Copy it from the example or create your own to start both the proxy server and Cloudflare tunnel in one click.
+**Windows users**: Run `start-proxy.bat` to start both the proxy server and Cloudflare tunnel in one click.
+
+**macOS/Linux users**: Run `./start-proxy.sh` to start both the proxy server and Cloudflare tunnel in one terminal.
 
 ### HTTPS via Cloudflare Tunnel
 
@@ -55,24 +57,60 @@ In Cursor Settings, set the **Override OpenAI Base URL** to your Cloudflare tunn
 | Variable | Default | Description |
 | --- | --- | --- |
 | `PORT` | `8082` | Proxy port |
-| `ANTHROPIC_API_KEY` | - | Fallback API key when Claude Code limits hit |
+| `ANTHROPIC_API_KEY` | - | Fallback API key when Claude Code limits hit; also needed for context summarization |
 | `CLAUDE_CODE_FIRST` | `true` | Set `false` to use direct API only |
 | `CLAUDE_CODE_EXTRA_INSTRUCTION` | *(see below)* | Extra system prompt appended after the required Claude Code prefix |
 | `OPENAI_API_KEY` | - | OpenAI/OpenRouter API key for non-Claude model passthrough |
 | `OPENAI_BASE_URL` | `https://api.openai.com` | OpenAI-compatible base URL (set to `https://openrouter.ai/api` for OpenRouter) |
-| `ALLOWED_IPS` | Cursor backend IPs | Comma-separated IP whitelist; only enforced for Cloudflare tunnel requests |
+| `ALLOWED_IPS` | Cursor backend IPs | Comma-separated IP whitelist; only enforced for tunnel requests |
+| `CONTEXT_STRATEGY` | `summarize` | Context management: `summarize`, `trim`, or `none` |
+| `CONTEXT_SUMMARIZATION_MODEL` | `claude-opus-4-5` | Model used for summarization |
+| `CONTEXT_MAX_TOKENS` | `200000` | Token threshold to trigger context management |
+| `CONTEXT_TARGET_TOKENS` | `180000` | Target token count after summarization |
+| `THINKING_BUDGET_HIGH` | `max` | Thinking budget for "high" — `max` = max_tokens - 1 |
+| `THINKING_BUDGET_MEDIUM` | `20000` | Thinking budget for "medium" |
+| `THINKING_BUDGET_LOW` | `5000` | Thinking budget for "low" |
+| `VERBOSE_LOGGING` | `false` | Enable detailed file logging to `api.log` |
 
 See `.env.example` for the full list with descriptions.
 
 ## How It Works
 
 ```
-Cursor → ccproxy → Claude Code OAuth (subscription)
-              ↓ fallback (429/403)
-         Anthropic API (direct, paid)
+Cursor → ccproxy (OpenAI format) → translate to Anthropic format
+                                  → count tokens (📊)
+                                  → summarize if over 200K (🔄)
+                                  → enable extended thinking if requested
+                                  → Claude Code OAuth (subscription)
+                                        ↓ fallback (429/403)
+                                    Anthropic API (direct, paid)
 ```
 
-Request metadata is logged to your local SQLite database for analytics and cost tracking.
+### Context Management
+
+When a request exceeds the 200K token limit, the proxy automatically manages context:
+
+- **📊 Token counting** — Every request is measured with accurate per-message token estimation (differentiated ratios for prose, JSON, tool schemas)
+- **🔄 Summarization** — Selects the oldest middle messages (protecting first 3 + last 10), calls Claude to summarize them, and replaces them with a compact summary. Iterates up to 2 times if needed.
+- **✂️ Trim fallback** — If summarization fails or isn't configured, falls back to dropping old messages.
+
+### Extended Thinking
+
+The proxy supports Anthropic's extended thinking with full best-practice compliance:
+
+- Model names like `claude-4.5-opus-high-thinking` are normalized and converted to the proper `thinking: { type: "enabled", budget_tokens: N }` API format
+- `max_tokens` is automatically bumped to 64K (the model maximum) when thinking is enabled
+- Incompatible parameters (`temperature`, `top_k`, `top_p`) are removed automatically
+- `tool_choice` is forced to `auto` if set to an incompatible value
+- Streaming is forced on when required (`max_tokens > 21,333`)
+- Interleaved thinking is enabled via the `interleaved-thinking-2025-05-14` beta header, allowing Claude to reason between tool calls
+
+### OAuth Token Management
+
+- Tokens are refreshed automatically and persisted back to `~/.claude/.credentials.json`
+- File locking (`.credentials.json.lock`) prevents race conditions with Claude CLI running in parallel
+- In-process mutex prevents concurrent refresh from parallel HTTP requests
+- Stale lock detection (>30s) with automatic cleanup
 
 ## Analytics
 
@@ -132,11 +170,11 @@ curl http://localhost:8082/analytics/requests?limit=10
 
 ## Known Limitations
 
-- **No thinking budget control** - The proxy does not set or forward the thinking budget that Cursor might otherwise configure when using Anthropic directly. Claude will use its default thinking behavior.
 - **Tool call translation edge cases** - OpenAI-format tool calls are translated to Claude's native format. Complex or deeply nested tool schemas may not translate perfectly.
 - **Cloudflare tunnel idle timeout** - Cloudflare enforces a ~60s idle timeout on HTTP/2 connections. The proxy sends SSE keepalive comments every 25s during silent periods (e.g., extended thinking) to prevent premature disconnection, but very long stalls may still drop.
-- **OAuth token refresh** - Claude Code OAuth tokens are refreshed automatically, but if the CLI session expires or is revoked you'll need to re-run `claude /login`.
 - **Streaming-only for Claude Code path** - The Claude Code OAuth path always uses streaming. Non-streaming requests are converted to streaming internally and the final result is assembled before responding.
+- **Max output 64K tokens** - All current Claude 4.5 models cap at 64K output tokens. With extended thinking enabled, `budget_tokens` is set to `max_tokens - 1` (63,999), leaving minimal room for text output in the base allocation. Interleaved thinking allows the budget to span across tool use turns.
+- **Context summarization requires API key** - The `summarize` strategy calls the Anthropic API directly (not via Claude Code OAuth) to summarize context, so it requires `ANTHROPIC_API_KEY` to be set.
 
 ## Troubleshooting
 
@@ -144,10 +182,12 @@ curl http://localhost:8082/analytics/requests?limit=10
 | --- | --- |
 | No credentials found | Run `claude /login` |
 | Token invalid / expired | Run `claude /login` again |
+| `invalid_grant` on refresh | Another process may have rotated the token. Run `claude /login` to get fresh credentials. |
 | Always falling back to API key | Check subscription limits, view `/analytics` |
 | Budget exceeded | Wait for reset, increase via `POST /budget`, or disable with `{"enabled": false}` |
-| Tunnel drops during long responses | This is a Cloudflare idle timeout issue; the proxy mitigates it with keepalives but very long thinking periods may still drop |
+| Tunnel drops during long responses | Cloudflare idle timeout; proxy mitigates with keepalives but very long thinking periods may still drop |
 | Cursor not using the proxy | Restart Cursor after changing the base URL override; toggle the setting off and on |
+| `prompt is too long` errors | Context management should handle this automatically. Check that `CONTEXT_STRATEGY=summarize` is set. |
 
 ## License
 
