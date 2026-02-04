@@ -184,7 +184,7 @@ function getContextConfig(): ContextConfig {
       (process.env.CONTEXT_STRATEGY as ContextConfig["strategy"]) ||
       "summarize",
     summarizationModel:
-      process.env.CONTEXT_SUMMARIZATION_MODEL || "claude-opus-4-5",
+      process.env.CONTEXT_SUMMARIZATION_MODEL || "claude-sonnet-4-5-20250929",
     maxTokens: parseInt(process.env.CONTEXT_MAX_TOKENS || "200000"),
     targetTokens: parseInt(process.env.CONTEXT_TARGET_TOKENS || "180000"),
   };
@@ -302,6 +302,111 @@ ${transcript}`,
 
   const data = (await response.json()) as AnthropicResponse;
   return data.content?.[0]?.text || "";
+}
+
+/**
+ * Clean up orphaned tool_use/tool_result pairs after summarization.
+ * This ensures every tool_result has a matching tool_use in a previous message,
+ * and every tool_use has a matching tool_result in a following message.
+ */
+function cleanupOrphanedToolPairs(messages: AnthropicMessage[]): AnthropicMessage[] {
+  // Step 1: Collect all valid tool_use IDs (from assistant messages)
+  const validToolUseIds = new Set<string>();
+  for (const msg of messages) {
+    if (msg.role === "assistant" && Array.isArray(msg.content)) {
+      for (const block of msg.content) {
+        if (block.type === "tool_use" && block.id) {
+          validToolUseIds.add(block.id);
+        }
+      }
+    }
+  }
+
+  // Step 2: Remove orphaned tool_result blocks (no matching tool_use)
+  let removedResults = 0;
+  for (const msg of messages) {
+    if (msg.role === "user" && Array.isArray(msg.content)) {
+      const originalLength = msg.content.length;
+      msg.content = msg.content.filter((block: ContentBlock) => {
+        if (block.type === "tool_result" && block.tool_use_id) {
+          const hasMatch = validToolUseIds.has(block.tool_use_id);
+          if (!hasMatch) removedResults++;
+          return hasMatch;
+        }
+        return true;
+      });
+    }
+  }
+
+  // Step 3: Collect all valid tool_result IDs (from user messages)
+  const validToolResultIds = new Set<string>();
+  for (const msg of messages) {
+    if (msg.role === "user" && Array.isArray(msg.content)) {
+      for (const block of msg.content) {
+        if (block.type === "tool_result" && block.tool_use_id) {
+          validToolResultIds.add(block.tool_use_id);
+        }
+      }
+    }
+  }
+
+  // Step 4: Remove orphaned tool_use blocks (no matching tool_result)
+  let removedUses = 0;
+  for (const msg of messages) {
+    if (msg.role === "assistant" && Array.isArray(msg.content)) {
+      msg.content = msg.content.filter((block: ContentBlock) => {
+        if (block.type === "tool_use" && block.id) {
+          const hasMatch = validToolResultIds.has(block.id);
+          if (!hasMatch) removedUses++;
+          return hasMatch;
+        }
+        return true;
+      });
+    }
+  }
+
+  // Step 5: Remove empty messages
+  const filteredMessages = messages.filter(msg => {
+    if (Array.isArray(msg.content)) {
+      return msg.content.length > 0;
+    }
+    return msg.content && (typeof msg.content === "string" ? msg.content.length > 0 : true);
+  });
+
+  // Step 6: Fix role alternation (merge consecutive same-role messages)
+  const result: AnthropicMessage[] = [];
+  for (const msg of filteredMessages) {
+    if (result.length === 0) {
+      result.push(msg);
+      continue;
+    }
+
+    const lastMsg = result[result.length - 1];
+    if (lastMsg.role === msg.role) {
+      // Merge with previous message
+      const toBlocks = (m: AnthropicMessage): ContentBlock[] => {
+        if (typeof m.content === "string") {
+          return [{ type: "text", text: m.content } as ContentBlock];
+        }
+        if (Array.isArray(m.content)) return m.content;
+        return [];
+      };
+      lastMsg.content = [...toBlocks(lastMsg), ...toBlocks(msg)];
+    } else {
+      result.push(msg);
+    }
+  }
+
+  // Step 7: Ensure first message is from user
+  if (result.length > 0 && result[0].role !== "user") {
+    result.unshift({ role: "user", content: "Continue." });
+  }
+
+  if (removedResults > 0 || removedUses > 0) {
+    console.log(`   🧹 Cleaned up ${removedResults} orphaned tool_result(s) and ${removedUses} orphaned tool_use(s)`);
+  }
+
+  return result;
 }
 
 /**
@@ -452,6 +557,12 @@ async function summarizeContext(
       const startTime = Date.now();
       summary = await callSummarizationAPI(toSummarize, config);
       const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+
+      // Validate summary is not empty
+      if (!summary || summary.trim().length < 50) {
+        throw new Error(`Summarization returned empty or too short result (${summary?.length || 0} chars)`);
+      }
+
       const summaryTokens = Math.ceil(summary.length / 3.5);
 
       console.log(
@@ -482,6 +593,9 @@ async function summarizeContext(
       ...after,
     ];
 
+    // Clean up any orphaned tool_use/tool_result pairs
+    result.messages = cleanupOrphanedToolPairs(result.messages);
+
     // Get accurate token count after summarization
     const estimate = countTokens(result);
     let newTokenCount: number;
@@ -510,12 +624,14 @@ async function summarizeContext(
 }
 
 /**
- * Emergency fallback: trim context by dropping old messages (moved from openai-adapter.ts)
+ * Emergency fallback: trim context by dropping old messages.
+ * Uses API token counts for accuracy when near the limit.
  */
-function trimToFitContext(
+async function trimToFitContext(
   result: AnthropicRequest,
-  targetTokens: number
-): AnthropicRequest {
+  targetTokens: number,
+  maxTokens: number
+): Promise<AnthropicRequest> {
   let counts = countTokens(result);
   if (counts.total <= targetTokens) return result;
 
@@ -535,12 +651,6 @@ function trimToFitContext(
     console.log(
       `   Step 1 (trim tool descriptions): ~${Math.round(counts.total / 1000)}K tokens`
     );
-    if (counts.total <= targetTokens) {
-      console.log(
-        `   ✓ Trimmed: ${Math.round(originalTotal / 1000)}K → ${Math.round(counts.total / 1000)}K tokens`
-      );
-      return result;
-    }
   }
 
   // Step 2: Truncate large content blocks
@@ -593,23 +703,29 @@ function trimToFitContext(
   console.log(
     `   Step 2 (trim large content blocks): ~${Math.round(counts.total / 1000)}K tokens`
   );
-  if (counts.total <= targetTokens) {
-    console.log(
-      `   ✓ Trimmed: ${Math.round(originalTotal / 1000)}K → ${Math.round(counts.total / 1000)}K tokens`
-    );
-    return result;
-  }
 
-  // Step 3: Drop oldest middle messages
-  const keepStart = 4;
+  // Step 3: Drop oldest middle messages using API counts for accuracy
+  // Get accurate count before heavy dropping
+  let apiResult = await countTokensAPI(result);
+  let currentTokens = apiResult.inputTokens;
+  console.log(`   Step 3: API count before dropping: ${Math.round(currentTokens / 1000)}K tokens`);
+
+  const keepStart = 2; // Keep first 2 messages (system context)
+  const minMessages = 4; // Minimum messages to keep
   let removed = 0;
+
   while (
-    counts.total > targetTokens &&
-    result.messages.length > keepStart + 4
+    currentTokens > targetTokens &&
+    result.messages.length > minMessages
   ) {
     result.messages.splice(keepStart, 2);
     removed += 2;
-    counts = countTokens(result);
+
+    // Re-check with API every 4 messages dropped (balance accuracy vs API calls)
+    if (removed % 4 === 0 || result.messages.length <= minMessages + 2) {
+      apiResult = await countTokensAPI(result);
+      currentTokens = apiResult.inputTokens;
+    }
   }
 
   if (removed > 0) {
@@ -690,14 +806,35 @@ function trimToFitContext(
       result.messages.unshift({ role: "user", content: "Continue." });
     }
 
-    counts = countTokens(result);
+    // Get final count after cleanup
+    apiResult = await countTokensAPI(result);
+    currentTokens = apiResult.inputTokens;
     console.log(
-      `   Step 3 (drop ${removed} middle messages, ${result.messages.length} remaining): ~${Math.round(counts.total / 1000)}K tokens`
+      `   Step 3 (drop ${removed} middle messages, ${result.messages.length} remaining): ${Math.round(currentTokens / 1000)}K tokens (api)`
     );
   }
 
+  // Step 4: Remove images if still over limit (last resort)
+  if (currentTokens > maxTokens) {
+    console.log(`   ⚠️ Still over limit (${Math.round(currentTokens / 1000)}K > ${Math.round(maxTokens / 1000)}K), removing images...`);
+    let imagesRemoved = 0;
+    for (const msg of result.messages) {
+      if (Array.isArray(msg.content)) {
+        const beforeCount = msg.content.length;
+        msg.content = msg.content.filter((b: any) => b.type !== "image");
+        imagesRemoved += beforeCount - msg.content.length;
+      }
+    }
+    if (imagesRemoved > 0) {
+      console.log(`   🗑️ Removed ${imagesRemoved} image(s)`);
+      apiResult = await countTokensAPI(result);
+      currentTokens = apiResult.inputTokens;
+      console.log(`   Step 4: ${Math.round(currentTokens / 1000)}K tokens after image removal`);
+    }
+  }
+
   console.log(
-    `   ✓ Trimmed: ${Math.round(originalTotal / 1000)}K → ${Math.round(counts.total / 1000)}K tokens`
+    `   ✓ Trimmed: ${Math.round(originalTotal / 1000)}K → ${Math.round(currentTokens / 1000)}K tokens`
   );
   return result;
 }
@@ -767,24 +904,51 @@ export async function manageContext(
 
       // Get final accurate count
       const finalApiResult = await countTokensAPI(result);
-      const finalTokenCount = finalApiResult.inputTokens;
+      let finalTokenCount = finalApiResult.inputTokens;
       console.log(`   ✅ Summarization complete: ${Math.round(finalTokenCount / 1000)}K tokens (${finalApiResult.source})`);
 
-      // If still over the hard limit, this is a critical failure
+      // If still over the hard limit, fall back to trimming
       if (finalTokenCount >= config.maxTokens) {
-        console.error(`   ❌ CRITICAL: Still over limit after summarization (${Math.round(finalTokenCount / 1000)}K >= ${Math.round(config.maxTokens / 1000)}K)`);
-        console.error(`   ❌ This may be due to protected messages or tools consuming too many tokens.`);
-        throw new Error(`Summarization failed to reduce context below ${config.maxTokens} tokens (final: ${finalTokenCount})`);
+        console.log(`   ⚠️ Still over limit after summarization (${Math.round(finalTokenCount / 1000)}K >= ${Math.round(config.maxTokens / 1000)}K), applying trim fallback...`);
+        result = await trimToFitContext(result, config.targetTokens, config.maxTokens);
+
+        // Re-count after trimming
+        const trimApiResult = await countTokensAPI(result);
+        finalTokenCount = trimApiResult.inputTokens;
+        console.log(`   ✅ After trimming: ${Math.round(finalTokenCount / 1000)}K tokens (${trimApiResult.source})`);
+
+        // If STILL over limit after both summarization and trimming, this is truly critical
+        if (finalTokenCount >= config.maxTokens) {
+          console.error(`   ❌ CRITICAL: Still over limit after summarization AND trimming (${Math.round(finalTokenCount / 1000)}K >= ${Math.round(config.maxTokens / 1000)}K)`);
+          console.error(`   ❌ Request may be fundamentally too large (e.g., single huge message or too many large images)`);
+
+          const dumpFile = `context-dump-${Date.now()}.json`;
+          try {
+            const dumpData = {
+              timestamp: new Date().toISOString(),
+              finalTokenCount,
+              maxTokens: config.maxTokens,
+              targetTokens: config.targetTokens,
+              strategy: config.strategy,
+              request: result
+            };
+            await Bun.write(dumpFile, JSON.stringify(dumpData, null, 2));
+            console.error(`   📄 Dumped full context to ${dumpFile}`);
+          } catch (dumpErr) {
+            console.error(`   ❌ Failed to dump context: ${dumpErr}`);
+          }
+
+          throw new Error(`Cannot reduce context below ${config.maxTokens} tokens (final: ${finalTokenCount})`);
+        }
       }
 
       return result;
     } catch (err) {
-      // DO NOT fall back to trim - error out so user knows summarization failed
-      console.error(`   ❌ Summarization failed:`, err);
+      console.error(`   ❌ Context management failed:`, err);
       throw err;
     }
   } else if (config.strategy === "trim") {
-    return trimToFitContext(structuredClone(req), config.targetTokens);
+    return await trimToFitContext(structuredClone(req), config.targetTokens, config.maxTokens);
   }
 
   // Strategy is "none" but we're over limit - shouldn't happen (we returned early)

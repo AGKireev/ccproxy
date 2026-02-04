@@ -124,12 +124,12 @@ export function normalizeModelName(model: string): { model: string; reasoningBud
       reasoningBudget: budget || undefined,
     };
   }
-  
+
   // Handle Anthropic format directly (passthrough)
   if (model.startsWith("claude-")) {
     return { model };
   }
-  
+
   // Unknown format, passthrough
   return { model };
 }
@@ -142,7 +142,7 @@ function convertContent(
   }
 
   const blocks: ContentBlock[] = [];
-  
+
   for (const part of content) {
     // Pass through Anthropic-format blocks (tool_use, tool_result) directly
     // Cursor sends these in Anthropic format, not OpenAI format
@@ -152,14 +152,14 @@ function convertContent(
       blocks.push(toolUse);
       continue;
     }
-    
+
     if ((part as ContentBlock).type === "tool_result") {
       const toolResult = part as ContentBlock;
       logger.verbose(`    [convertContent] Passing through tool_result block: tool_use_id=${toolResult.tool_use_id}`);
       blocks.push(toolResult);
       continue;
     }
-    
+
     // Handle OpenAI format parts
     const openaiPart = part as OpenAIContentPart;
     if (openaiPart.type === "text") {
@@ -198,8 +198,36 @@ function convertContent(
       }
     }
   }
-  
+
   return blocks;
+}
+
+function deduplicateTextBlocks(blocks: ContentBlock[]): ContentBlock[] {
+  const seen = new Set<string>();
+  const uniqueBlocks: ContentBlock[] = [];
+  let duplicatesRemoved = 0;
+
+  for (const block of blocks) {
+    if (block.type === "text" && block.text) {
+      // Use text content as key for deduplication
+      // This handles the case where Cursor sends duplicate context blocks (e.g. system reminders)
+      // repeatedly in the same message content array
+      const key = block.text;
+      if (seen.has(key)) {
+        duplicatesRemoved++;
+        continue;
+      }
+      seen.add(key);
+    }
+    uniqueBlocks.push(block);
+  }
+
+  if (duplicatesRemoved > 0) {
+    logger.verbose(`    [deduplicate] Removed ${duplicatesRemoved} duplicate text blocks`);
+    console.log(`    [deduplicate] Removed ${duplicatesRemoved} duplicate text blocks from user message`);
+  }
+
+  return uniqueBlocks;
 }
 
 export function openaiToAnthropic(request: OpenAIChatRequest): AnthropicRequest {
@@ -213,10 +241,10 @@ export function openaiToAnthropic(request: OpenAIChatRequest): AnthropicRequest 
     const msg = request.messages[i];
     const hasToolCalls = (msg as OpenAIMessage).tool_calls?.length || 0;
     const hasToolCallId = (msg as OpenAIMessage).tool_call_id || null;
-    const contentPreview = typeof msg.content === "string" 
-      ? msg.content.slice(0, 100) 
-      : Array.isArray(msg.content) 
-        ? `[${msg.content.length} parts]` 
+    const contentPreview = typeof msg.content === "string"
+      ? msg.content.slice(0, 100)
+      : Array.isArray(msg.content)
+        ? `[${msg.content.length} parts]`
         : String(msg.content).slice(0, 100);
     logger.verbose(`  [${i}] role=${msg.role}, tool_calls=${hasToolCalls}, tool_call_id=${hasToolCallId}, content=${contentPreview}...`);
   }
@@ -234,7 +262,7 @@ export function openaiToAnthropic(request: OpenAIChatRequest): AnthropicRequest 
     } else if (msg.role === "assistant") {
       // Handle assistant messages - may have tool_calls
       const contentBlocks: ContentBlock[] = [];
-      
+
       // Add text content if present
       if (msg.content) {
         const convertedContent = convertContent(msg.content);
@@ -244,7 +272,7 @@ export function openaiToAnthropic(request: OpenAIChatRequest): AnthropicRequest 
           contentBlocks.push(...convertedContent);
         }
       }
-      
+
       // Convert tool_calls to Anthropic tool_use blocks
       if (msg.tool_calls && msg.tool_calls.length > 0) {
         logger.verbose(`  Converting ${msg.tool_calls.length} tool_calls to tool_use blocks`);
@@ -265,7 +293,7 @@ export function openaiToAnthropic(request: OpenAIChatRequest): AnthropicRequest 
           });
         }
       }
-      
+
       if (contentBlocks.length > 0) {
         messages.push({
           role: "assistant",
@@ -277,13 +305,13 @@ export function openaiToAnthropic(request: OpenAIChatRequest): AnthropicRequest 
       logger.verbose(`  Converting tool result: tool_call_id=${msg.tool_call_id}`);
       const resultContent = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
       logger.verbose(`    -> tool_result content (first 500 chars): ${resultContent.slice(0, 500)}`);
-      
+
       const toolResultContent: ContentBlock[] = [{
         type: "tool_result",
         tool_use_id: msg.tool_call_id || "",
         content: resultContent,
       }];
-      
+
       // Check if the last message is a user message - if so, append to it
       const lastMsg = messages[messages.length - 1];
       if (lastMsg && lastMsg.role === "user" && Array.isArray(lastMsg.content)) {
@@ -297,7 +325,7 @@ export function openaiToAnthropic(request: OpenAIChatRequest): AnthropicRequest 
         });
       }
     } else if (msg.role === "user") {
-      const convertedContent = convertContent(msg.content || "");
+      let convertedContent = convertContent(msg.content || "");
       // Skip messages with no valid content blocks
       if (typeof convertedContent === "string") {
         // String content: skip if empty
@@ -305,7 +333,8 @@ export function openaiToAnthropic(request: OpenAIChatRequest): AnthropicRequest 
           continue;
         }
       } else {
-        // Array content: skip if empty after filtering
+        // Array content: deduplicate and check if empty
+        convertedContent = deduplicateTextBlocks(convertedContent);
         if (convertedContent.length === 0) {
           continue;
         }
@@ -316,7 +345,7 @@ export function openaiToAnthropic(request: OpenAIChatRequest): AnthropicRequest 
       });
     }
   }
-  
+
   // Log converted messages summary
   logger.verbose(`\nConverted to ${messages.length} Anthropic messages:`);
   for (let i = 0; i < messages.length; i++) {
@@ -337,15 +366,15 @@ export function openaiToAnthropic(request: OpenAIChatRequest): AnthropicRequest 
 
   // Normalize model name from Cursor format
   const normalized = normalizeModelName(request.model);
-  
+
   // Determine max_tokens: use Cursor's value or default to 4096
   const maxTokens = request.max_tokens || request.max_completion_tokens || 4096;
-  const maxTokensSource = request.max_tokens 
-    ? "Cursor (max_tokens)" 
-    : request.max_completion_tokens 
-    ? "Cursor (max_completion_tokens)" 
-    : "Default (4096)";
-  
+  const maxTokensSource = request.max_tokens
+    ? "Cursor (max_tokens)"
+    : request.max_completion_tokens
+      ? "Cursor (max_completion_tokens)"
+      : "Default (4096)";
+
   console.log(`   [Debug] Normalized model: "${request.model}" → "${normalized.model}"${normalized.reasoningBudget ? ` (thinking: ${normalized.reasoningBudget})` : ""}`);
   console.log(`   [Debug] Max tokens: ${maxTokens} (${maxTokensSource})`);
 
@@ -363,7 +392,7 @@ export function openaiToAnthropic(request: OpenAIChatRequest): AnthropicRequest 
         : [request.stop]
       : undefined,
   };
-  
+
   // Pass through tools - Cursor already sends them in Anthropic format
   // (name, description, input_schema) not OpenAI format (type: "function", function: {...})
   if (request.tools && request.tools.length > 0) {
@@ -386,12 +415,12 @@ export function openaiToAnthropic(request: OpenAIChatRequest): AnthropicRequest 
     }) as unknown as typeof result.tools;
     console.log(`   [Debug] Passing ${request.tools.length} tools to Anthropic`);
   }
-  
+
   // Pass through tool_choice - Cursor sends it in Anthropic format
   if (request.tool_choice) {
     result.tool_choice = request.tool_choice as unknown as typeof result.tool_choice;
   }
-  
+
   // Add extended thinking if reasoning budget is specified
   if (normalized.reasoningBudget) {
     const config = getConfig();
@@ -434,7 +463,7 @@ export function openaiToAnthropic(request: OpenAIChatRequest): AnthropicRequest 
 
     console.log(`   [Debug] Extended thinking: budget_tokens=${budgetTokens}, max_tokens=${result.max_tokens}`);
   }
-  
+
   return result;
 }
 
@@ -546,12 +575,12 @@ export function createOpenAIToolCallChunk(
   const toolCall: OpenAIStreamChunkToolCall = {
     index: toolCallIndex,
   };
-  
+
   if (toolCallId) {
     toolCall.id = toolCallId;
     toolCall.type = "function";
   }
-  
+
   if (functionName || functionArgs) {
     toolCall.function = {};
     if (functionName) toolCall.function.name = functionName;
@@ -593,20 +622,20 @@ export interface ParsedToolCall {
  */
 export function parseXMLToolCalls(text: string): ParsedToolCall[] {
   const toolCalls: ParsedToolCall[] = [];
-  
+
   // Match <invoke name="...">...</invoke> format
   const invokeMatches = text.matchAll(/<invoke\s+name=["']([^"']+)["']>([\s\S]*?)<\/invoke>/gi);
   for (const match of invokeMatches) {
     const name = match[1];
     const content = match[2];
     const args: Record<string, unknown> = {};
-    
+
     // Extract parameters
     const paramMatches = content.matchAll(/<parameter\s+name=["']([^"']+)["']>([^<]*)<\/parameter>/gi);
     for (const paramMatch of paramMatches) {
       const paramName = paramMatch[1];
       let paramValue: unknown = paramMatch[2];
-      
+
       // Try to parse JSON values (arrays, objects)
       try {
         if (paramValue.startsWith("[") || paramValue.startsWith("{")) {
@@ -615,64 +644,64 @@ export function parseXMLToolCalls(text: string): ParsedToolCall[] {
       } catch {
         // Keep as string
       }
-      
+
       args[paramName] = paramValue;
     }
-    
+
     toolCalls.push({ name, arguments: args });
   }
-  
+
   // Match <search_files>...</search_files> format
   const searchFilesMatches = text.matchAll(/<search_files>([\s\S]*?)<\/search_files>/gi);
   for (const match of searchFilesMatches) {
     const content = match[1];
     const args: Record<string, unknown> = {};
-    
+
     const pathMatch = content.match(/<path>([^<]*)<\/path>/i);
     const regexMatch = content.match(/<regex>([^<]*)<\/regex>/i);
     const patternMatch = content.match(/<file_pattern>([^<]*)<\/file_pattern>/i);
-    
+
     if (pathMatch) args.path = pathMatch[1].trim();
     if (regexMatch) args.pattern = regexMatch[1].trim();
     if (patternMatch) args.glob = patternMatch[1].trim();
-    
+
     toolCalls.push({ name: "grep", arguments: args });
   }
-  
+
   // Match <read_file>...</read_file> format
   const readFileMatches = text.matchAll(/<read_file>([\s\S]*?)<\/read_file>/gi);
   for (const match of readFileMatches) {
     const content = match[1];
     const args: Record<string, unknown> = {};
-    
+
     const pathMatch = content.match(/<path>([^<]*)<\/path>/i);
     const startMatch = content.match(/<start_line>(\d+)<\/start_line>/i);
     const endMatch = content.match(/<end_line>(\d+)<\/end_line>/i);
-    
+
     if (pathMatch) args.target_file = pathMatch[1].trim();
     if (startMatch) args.offset = parseInt(startMatch[1]);
     if (endMatch && startMatch) {
       args.limit = parseInt(endMatch[1]) - parseInt(startMatch[1]) + 1;
     }
-    
+
     toolCalls.push({ name: "read_file", arguments: args });
   }
-  
+
   // Match <grep>...</grep> format
   const grepMatches = text.matchAll(/<grep>([\s\S]*?)<\/grep>/gi);
   for (const match of grepMatches) {
     const content = match[1];
     const args: Record<string, unknown> = {};
-    
+
     const patternMatch = content.match(/<pattern>([^<]*)<\/pattern>/i);
     const pathMatch = content.match(/<path>([^<]*)<\/path>/i);
-    
+
     if (patternMatch) args.pattern = patternMatch[1].trim();
     if (pathMatch) args.path = pathMatch[1].trim();
-    
+
     toolCalls.push({ name: "grep", arguments: args });
   }
-  
+
   return toolCalls;
 }
 
