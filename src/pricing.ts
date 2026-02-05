@@ -9,9 +9,10 @@ export interface ModelPricing {
   outputPerMTok: number;
 }
 
-// Pricing as of late 2025
+// Pricing as of early 2026
 const MODEL_PRICING: Record<string, ModelPricing> = {
   // Opus 4.x
+  "claude-opus-4-6": { inputPerMTok: 5.0, outputPerMTok: 25.0 },
   "claude-opus-4-5": { inputPerMTok: 5.0, outputPerMTok: 25.0 },
   "claude-opus-4-1": { inputPerMTok: 15.0, outputPerMTok: 75.0 },
   "claude-opus-4": { inputPerMTok: 15.0, outputPerMTok: 75.0 },

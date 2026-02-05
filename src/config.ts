@@ -48,7 +48,10 @@ export function getConfig(): ProxyConfig {
     openaiBaseUrl: process.env.OPENAI_BASE_URL || "https://api.openai.com",
     allowedIPs,
     contextStrategy: (process.env.CONTEXT_STRATEGY as "summarize" | "trim" | "none") || "summarize",
-    contextSummarizationModel: process.env.CONTEXT_SUMMARIZATION_MODEL || "claude-opus-4-5",
+    contextSummarizationModel: process.env.CONTEXT_SUMMARIZATION_MODEL || "claude-sonnet-4-5-20250929",
+    // Claude Code OAuth enforces 200K server-side regardless of model capability (1M).
+    // Requests over 200K get 400: "prompt is too long". Use env vars to override if
+    // Anthropic raises this limit in the future.
     contextMaxTokens: parseInt(process.env.CONTEXT_MAX_TOKENS || "200000"),
     contextTargetTokens: parseInt(process.env.CONTEXT_TARGET_TOKENS || "180000"),
     thinkingBudgetHigh: process.env.THINKING_BUDGET_HIGH || "max",

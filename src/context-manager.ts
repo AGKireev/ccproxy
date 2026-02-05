@@ -11,7 +11,7 @@ import type {
 const COMPRESSION_RATIO = 0.3; // summary is ~30% of original
 const PROTECT_FIRST = 3; // protect first 3 messages (system context, initial instructions)
 const PROTECT_LAST = 10; // protect last 10 messages (recent conversation)
-const MAX_ITERATIONS = 2;
+const MAX_ITERATIONS = 3;
 
 // --- Summarization Cache ---
 // Prevents re-summarizing the same messages multiple times.
@@ -185,6 +185,7 @@ function getContextConfig(): ContextConfig {
       "summarize",
     summarizationModel:
       process.env.CONTEXT_SUMMARIZATION_MODEL || "claude-sonnet-4-5-20250929",
+    // Claude Code OAuth enforces 200K server-side (400: "prompt is too long" above this)
     maxTokens: parseInt(process.env.CONTEXT_MAX_TOKENS || "200000"),
     targetTokens: parseInt(process.env.CONTEXT_TARGET_TOKENS || "180000"),
   };
@@ -192,49 +193,70 @@ function getContextConfig(): ContextConfig {
 
 /**
  * Format messages into a readable transcript for summarization.
- * Preserves full content for quality summarization, with a cap to avoid
- * exceeding the summarization model's own context limit.
+ * Preserves coverage of ALL messages by truncating per-message content
+ * rather than cutting the middle of the concatenated transcript.
  */
 function formatTranscript(messages: AnthropicMessage[]): string {
   const MAX_TRANSCRIPT_CHARS = 400000; // ~115K tokens at 3.5 chars/token — safe for most models
 
-  let transcript = messages
+  // First pass: format each message with generous per-block limits
+  const formatted = messages.map((m) => {
+    let text: string;
+    if (typeof m.content === "string") {
+      text = m.content;
+    } else if (Array.isArray(m.content)) {
+      text = m.content
+        .map((block) => {
+          if (block.type === "text" && block.text) return block.text;
+          if (block.type === "tool_use")
+            return `[Tool Call: ${block.name}(${JSON.stringify(block.input).slice(0, 2000)})]`;
+          if (block.type === "tool_result") {
+            const content =
+              typeof block.content === "string"
+                ? block.content
+                : JSON.stringify(block.content);
+            return `[Tool Result: ${content?.slice(0, 2000)}]`;
+          }
+          return JSON.stringify(block).slice(0, 500);
+        })
+        .join("\n");
+    } else {
+      text = String(m.content);
+    }
+    return { role: m.role, text };
+  });
+
+  // Check total size
+  const totalChars = formatted.reduce((sum, m) => sum + m.text.length + 20, 0); // +20 for role label + separators
+
+  if (totalChars <= MAX_TRANSCRIPT_CHARS) {
+    // Under limit — use full content
+    return formatted
+      .map((m) => `[${m.role.toUpperCase()}]:\n${m.text}`)
+      .join("\n\n---\n\n");
+  }
+
+  // Over limit — calculate per-message budget and truncate individually
+  // This preserves coverage of ALL messages instead of losing the middle
+  const overhead = messages.length * 20; // role labels + separators
+  const availableChars = MAX_TRANSCRIPT_CHARS - overhead;
+  const perMessageBudget = Math.floor(availableChars / messages.length);
+
+  console.log(
+    `   📝 Transcript too large (${Math.round(totalChars / 1000)}K chars), truncating to ~${Math.round(perMessageBudget / 1000)}K chars per message`
+  );
+
+  return formatted
     .map((m) => {
-      let text: string;
-      if (typeof m.content === "string") {
-        text = m.content;
-      } else if (Array.isArray(m.content)) {
-        text = m.content
-          .map((block) => {
-            if (block.type === "text" && block.text) return block.text;
-            if (block.type === "tool_use")
-              return `[Tool Call: ${block.name}(${JSON.stringify(block.input).slice(0, 2000)})]`;
-            if (block.type === "tool_result") {
-              const content =
-                typeof block.content === "string"
-                  ? block.content
-                  : JSON.stringify(block.content);
-              return `[Tool Result: ${content?.slice(0, 2000)}]`;
-            }
-            return JSON.stringify(block).slice(0, 500);
-          })
-          .join("\n");
-      } else {
-        text = String(m.content);
+      let text = m.text;
+      if (text.length > perMessageBudget) {
+        // Keep start + end of each message to preserve context
+        const half = Math.floor(perMessageBudget / 2);
+        text = text.slice(0, half) + "\n...[truncated]...\n" + text.slice(-half);
       }
       return `[${m.role.toUpperCase()}]:\n${text}`;
     })
     .join("\n\n---\n\n");
-
-  // Cap transcript to avoid exceeding summarization model's context
-  if (transcript.length > MAX_TRANSCRIPT_CHARS) {
-    transcript =
-      transcript.slice(0, MAX_TRANSCRIPT_CHARS / 2) +
-      "\n\n...[transcript truncated for summarization limit]...\n\n" +
-      transcript.slice(-MAX_TRANSCRIPT_CHARS / 2);
-  }
-
-  return transcript;
 }
 
 /**
@@ -252,9 +274,13 @@ async function callSummarizationAPI(
 
   const transcript = formatTranscript(messages);
 
-  // Build request with required Claude Code system prompt
+  // Build system prompt: Claude Code required prefix + summarizer role instruction
   const systemBlocks = [
     { type: "text", text: CLAUDE_CODE_SYSTEM_PROMPT },
+    {
+      type: "text",
+      text: `You are also acting as a conversation summarizer. Summarize coding assistant conversations concisely and accurately. Preserve ALL technical details: file paths, function signatures, code snippets, error messages, and their resolutions. Be dense and factual. Output only the summary.`,
+    },
   ];
 
   const response = await fetch(`${ANTHROPIC_API_URL}/v1/messages`, {
@@ -268,13 +294,13 @@ async function callSummarizationAPI(
     },
     body: JSON.stringify({
       model: config.summarizationModel,
-      max_tokens: 4096,
+      max_tokens: 16384,
       stream: false,
       system: systemBlocks,
       messages: [
         {
           role: "user",
-          content: `You are a conversation summarizer for a coding assistant. Summarize the following conversation excerpt concisely, preserving ALL of the following:
+          content: `Summarize the following conversation excerpt, preserving:
 
 - Key decisions and conclusions reached
 - Important code snippets, file paths, and technical details
@@ -283,14 +309,13 @@ async function callSummarizationAPI(
 - Any unresolved questions or action items
 - Error messages and their resolutions
 
-Be dense and factual. Preserve technical accuracy. Output only the summary.
-
 ---
 
 ${transcript}`,
         },
       ],
     }),
+    signal: AbortSignal.timeout(120_000), // 120s timeout for large summarizations
   });
 
   if (!response.ok) {
@@ -301,6 +326,12 @@ ${transcript}`,
   }
 
   const data = (await response.json()) as AnthropicResponse;
+
+  // Warn if summary was truncated due to max_tokens
+  if (data.stop_reason === "max_tokens") {
+    console.warn(`   ⚠️ Summary was truncated (hit max_tokens). Consider increasing max_tokens or reducing input.`);
+  }
+
   return data.content?.[0]?.text || "";
 }
 
@@ -474,9 +505,16 @@ function adjustBoundary(
   return adjusted;
 }
 
+interface SummarizeResult {
+  request: AnthropicRequest;
+  finalTokenCount: number;
+  countSource: "api" | "estimate";
+}
+
 /**
  * Summarize selected messages to reduce context size.
  * Uses cache to avoid re-summarizing the same messages on subsequent requests.
+ * Returns both the modified request AND the final token count to avoid redundant API calls.
  *
  * @param req - The request to summarize
  * @param config - Context configuration
@@ -486,8 +524,9 @@ async function summarizeContext(
   req: AnthropicRequest,
   config: ContextConfig,
   currentTokenCount: number
-): Promise<AnthropicRequest> {
+): Promise<SummarizeResult> {
   let result = structuredClone(req);
+  let countSource: "api" | "estimate" = "estimate";
 
   for (let iter = 0; iter < MAX_ITERATIONS; iter++) {
     // Use targetTokens (180K) not maxTokens (200K) - we want a safety margin!
@@ -573,8 +612,6 @@ async function summarizeContext(
       cacheSummary(req, toSummarize, summary);
     }
 
-    const summaryTokens = Math.ceil(summary.length / 3.5);
-
     // Replace selected messages with summary pair
     const before = messages.slice(0, middleStart);
     const after = messages.slice(selectEnd);
@@ -605,11 +642,13 @@ async function summarizeContext(
       console.log(`   🔄 Re-counting tokens via API (estimate ~${Math.round(estimate.total / 1000)}K)...`);
       const apiResult = await countTokensAPI(result);
       newTokenCount = apiResult.inputTokens;
+      countSource = apiResult.source;
       if (apiResult.source === "api") {
         console.log(`   🔄 API count: ${Math.round(newTokenCount / 1000)}K tokens`);
       }
     } else {
       newTokenCount = estimate.total;
+      countSource = "estimate";
     }
 
     console.log(
@@ -620,7 +659,7 @@ async function summarizeContext(
     currentTokenCount = newTokenCount;
   }
 
-  return result;
+  return { request: result, finalTokenCount: currentTokenCount, countSource };
 }
 
 /**
@@ -708,7 +747,12 @@ async function trimToFitContext(
   // Get accurate count before heavy dropping
   let apiResult = await countTokensAPI(result);
   let currentTokens = apiResult.inputTokens;
-  console.log(`   Step 3: API count before dropping: ${Math.round(currentTokens / 1000)}K tokens`);
+  let usingEstimate = apiResult.source === "estimate";
+  if (usingEstimate) {
+    console.log(`   ⚠️ Step 3: API count unavailable, using estimate: ~${Math.round(currentTokens / 1000)}K tokens`);
+  } else {
+    console.log(`   Step 3: API count before dropping: ${Math.round(currentTokens / 1000)}K tokens`);
+  }
 
   const keepStart = 2; // Keep first 2 messages (system context)
   const minMessages = 4; // Minimum messages to keep
@@ -725,6 +769,16 @@ async function trimToFitContext(
     if (removed % 4 === 0 || result.messages.length <= minMessages + 2) {
       apiResult = await countTokensAPI(result);
       currentTokens = apiResult.inputTokens;
+      usingEstimate = apiResult.source === "estimate";
+    } else {
+      // Quick estimate between API calls to avoid over-dropping
+      const est = countTokens(result);
+      if (est.total <= targetTokens) {
+        // Estimate says we're probably under target — verify with API before stopping
+        apiResult = await countTokensAPI(result);
+        currentTokens = apiResult.inputTokens;
+        usingEstimate = apiResult.source === "estimate";
+      }
     }
   }
 
@@ -900,12 +954,18 @@ export async function manageContext(
   if (config.strategy === "summarize") {
     try {
       // Pass the accurate token count to summarizeContext
-      let result = await summarizeContext(req, config, tokenCount);
+      const summarized = await summarizeContext(req, config, tokenCount);
+      let result = summarized.request;
+      let finalTokenCount = summarized.finalTokenCount;
 
-      // Get final accurate count
-      const finalApiResult = await countTokensAPI(result);
-      let finalTokenCount = finalApiResult.inputTokens;
-      console.log(`   ✅ Summarization complete: ${Math.round(finalTokenCount / 1000)}K tokens (${finalApiResult.source})`);
+      // If summarizeContext used estimate, verify with API before deciding
+      if (summarized.countSource === "estimate" && finalTokenCount >= config.targetTokens * 0.9) {
+        const verifyResult = await countTokensAPI(result);
+        finalTokenCount = verifyResult.inputTokens;
+        console.log(`   ✅ Summarization complete: ${Math.round(finalTokenCount / 1000)}K tokens (verified via ${verifyResult.source})`);
+      } else {
+        console.log(`   ✅ Summarization complete: ${Math.round(finalTokenCount / 1000)}K tokens (${summarized.countSource})`);
+      }
 
       // If still over the hard limit, fall back to trimming
       if (finalTokenCount >= config.maxTokens) {

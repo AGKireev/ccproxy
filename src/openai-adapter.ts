@@ -111,16 +111,18 @@ export interface OpenAIStreamChunk {
  * Examples:
  * - claude-4.5-opus-high → claude-opus-4-5 (with reasoning_budget: high)
  * - claude-4.5-opus-high-thinking → claude-opus-4-5 (with reasoning_budget: high)
+ * - claude-4.6-opus-max-thinking → claude-opus-4-6 (with reasoning_budget: max)
  * - claude-4.5-sonnet-high → claude-sonnet-4-5 (with reasoning_budget: high)
  * - claude-4.5-haiku → claude-haiku-4-5
+ * - claude-4.6-opus-high → claude-opus-4-6 (with reasoning_budget: high)
  */
 export function normalizeModelName(model: string): { model: string; reasoningBudget?: string } {
-  // Handle Cursor's format: claude-4.5-{model}-{budget} or claude-4.5-{model}-{budget}-thinking
-  const match = model.match(/^claude-4\.5-(opus|sonnet|haiku)(?:-(high|medium|low))?(?:-thinking)?$/);
+  // Handle Cursor's format: claude-4.{minor}-{model}-{budget} or claude-4.{minor}-{model}-{budget}-thinking
+  const match = model.match(/^claude-4\.(\d+)-(opus|sonnet|haiku)(?:-(high|medium|low|max))?(?:-thinking)?$/);
   if (match) {
-    const [, modelType, budget] = match;
+    const [, minor, modelType, budget] = match;
     return {
-      model: `claude-${modelType}-4-5`,
+      model: `claude-${modelType}-4-${minor}`,
       reasoningBudget: budget || undefined,
     };
   }
@@ -433,6 +435,7 @@ export function openaiToAnthropic(request: OpenAIChatRequest): AnthropicRequest 
     }
 
     const budgetMap: Record<string, string | number> = {
+      max: "max",
       high: config.thinkingBudgetHigh,
       medium: config.thinkingBudgetMedium,
       low: config.thinkingBudgetLow,

@@ -1306,6 +1306,13 @@ const server = Bun.serve({
       return Response.json({
         object: "list",
         data: [
+          // Claude 4.6 models (Anthropic format)
+          {
+            id: "claude-opus-4-6",
+            object: "model",
+            created: 1738800000,
+            owned_by: "anthropic",
+          },
           // Claude 4.5 models (Anthropic format)
           {
             id: "claude-sonnet-4-5",
@@ -1326,6 +1333,18 @@ const server = Bun.serve({
             owned_by: "anthropic",
           },
           // Cursor format models (will be normalized)
+          {
+            id: "claude-4.6-opus-max-thinking",
+            object: "model",
+            created: 1738800000,
+            owned_by: "anthropic",
+          },
+          {
+            id: "claude-4.6-opus-high",
+            object: "model",
+            created: 1738800000,
+            owned_by: "anthropic",
+          },
           {
             id: "claude-4.5-opus-high",
             object: "model",
