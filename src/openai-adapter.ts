@@ -51,6 +51,7 @@ export interface OpenAIChatRequest {
   temperature?: number;
   top_p?: number;
   stream?: boolean;
+  stream_options?: { include_usage?: boolean };
   stop?: string | string[];
   presence_penalty?: number;
   frequency_penalty?: number;
@@ -104,6 +105,11 @@ export interface OpenAIStreamChunk {
     };
     finish_reason: "stop" | "length" | "content_filter" | "tool_calls" | null;
   }[];
+  usage?: {
+    prompt_tokens: number;
+    completion_tokens: number;
+    total_tokens: number;
+  } | null;
 }
 
 /**
@@ -523,7 +529,7 @@ export function createOpenAIStreamChunk(
   id: string,
   model: string,
   content?: string,
-  finishReason?: "stop" | "length" | null
+  finishReason?: "stop" | "length" | "tool_calls" | null
 ): string {
   const chunk: OpenAIStreamChunk = {
     id: `chatcmpl-${id}`,
@@ -555,6 +561,33 @@ export function createOpenAIStreamStart(id: string, model: string): string {
         finish_reason: null,
       },
     ],
+  };
+
+  return `data: ${JSON.stringify(chunk)}\n\n`;
+}
+
+/**
+ * Create the final OpenAI stream chunk with usage statistics.
+ * Per the OpenAI spec, this chunk has `choices: []` and contains usage data.
+ * Sent after the last content chunk (with finish_reason) and before [DONE].
+ */
+export function createOpenAIStreamUsageChunk(
+  id: string,
+  model: string,
+  promptTokens: number,
+  completionTokens: number
+): string {
+  const chunk = {
+    id: `chatcmpl-${id}`,
+    object: "chat.completion.chunk",
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [] as never[],
+    usage: {
+      prompt_tokens: promptTokens,
+      completion_tokens: completionTokens,
+      total_tokens: promptTokens + completionTokens,
+    },
   };
 
   return `data: ${JSON.stringify(chunk)}\n\n`;

@@ -7,6 +7,7 @@ import {
   anthropicToOpenai,
   createOpenAIStreamChunk,
   createOpenAIStreamStart,
+  createOpenAIStreamUsageChunk,
   createOpenAIToolCallChunk,
   parseXMLToolCalls,
   type OpenAIChatRequest,
@@ -22,6 +23,7 @@ import {
   updateBudgetSettings,
   getRecentRequests,
   resetAnalytics,
+  recordRequest,
   type BudgetSettings,
 } from "./src/db";
 import { formatCost } from "./src/pricing";
@@ -258,7 +260,7 @@ const server = Bun.serve({
           } | max_tokens=${body.max_tokens}`
         );
 
-        const managedBody = await manageContext(body);
+        const { request: managedBody } = await manageContext(body);
         const response = await proxyRequest(
           "/v1/messages",
           managedBody,
@@ -480,7 +482,8 @@ const server = Bun.serve({
           );
         }
 
-        const managedBody = await manageContext(anthropicBody);
+        const { request: managedBody, originalTokenCount } = await manageContext(anthropicBody);
+        const proxyStartTime = Date.now();
         const response = await proxyRequest(
           "/v1/messages",
           managedBody,
@@ -550,6 +553,8 @@ const server = Bun.serve({
               const KEEPALIVE_INTERVAL = 25000; // Send keepalive every 25s to prevent tunnel idle timeout
               let blockTextSent = false; // Track if we've sent text from content_block_start
               let toolCallIndex = 0; // Track tool call index for OpenAI format
+              let streamInputTokens = 0; // Captured from message_start event
+              let streamOutputTokens = 0; // Captured from message_delta event
               let currentToolCall: {
                 id: string;
                 name: string;
@@ -638,8 +643,14 @@ const server = Bun.serve({
                         );
                       }
 
-                      // Handle message_start - send OpenAI start chunk
+                      // Handle message_start - send OpenAI start chunk and capture input tokens
                       if (event.type === "message_start" && !sentStart) {
+                        // Capture input token count from Anthropic
+                        if (event.message?.usage?.input_tokens) {
+                          streamInputTokens = event.message.usage.input_tokens;
+                          console.log(`   [Debug] Captured input_tokens from message_start: ${streamInputTokens}`);
+                        }
+
                         safeEnqueue(
                           new TextEncoder().encode(
                             createOpenAIStreamStart(streamId, openaiBody.model)
@@ -1117,6 +1128,15 @@ const server = Bun.serve({
                         lastChunkTime = Date.now();
                       }
 
+                      // Handle message_delta - capture output token count
+                      if (event.type === "message_delta") {
+                        if (event.usage?.output_tokens) {
+                          streamOutputTokens = event.usage.output_tokens;
+                          console.log(`   [Debug] Captured output_tokens from message_delta: ${streamOutputTokens}`);
+                        }
+                        continue;
+                      }
+
                       // Handle message_stop
                       if (event.type === "message_stop") {
                         // Flush any remaining tool call buffer (force flush)
@@ -1186,10 +1206,36 @@ const server = Bun.serve({
                               streamId,
                               openaiBody.model,
                               undefined,
-                              finishReason as "stop" | "length"
+                              finishReason as "stop" | "length" | "tool_calls"
                             )
                           )
                         );
+
+                        // Emit usage chunk before [DONE] so Cursor can track context size
+                        // Use originalTokenCount (pre-summarization) so Cursor sees actual context size
+                        const reportedPromptTokens = originalTokenCount > 0 ? originalTokenCount : streamInputTokens;
+                        safeEnqueue(
+                          new TextEncoder().encode(
+                            createOpenAIStreamUsageChunk(
+                              streamId,
+                              openaiBody.model,
+                              reportedPromptTokens,
+                              streamOutputTokens
+                            )
+                          )
+                        );
+                        console.log(`   [Usage] Streaming usage: prompt_tokens=${reportedPromptTokens} (original=${originalTokenCount}, anthropic=${streamInputTokens}), completion_tokens=${streamOutputTokens}`);
+
+                        // Record analytics with actual streaming token counts
+                        recordRequest({
+                          model: managedBody.model,
+                          source: "claude_code",
+                          inputTokens: streamInputTokens,
+                          outputTokens: streamOutputTokens,
+                          stream: true,
+                          latencyMs: Date.now() - proxyStartTime,
+                        });
+
                         safeEnqueue(
                           new TextEncoder().encode("data: [DONE]\n\n")
                         );
@@ -1290,6 +1336,13 @@ const server = Bun.serve({
           anthropicResponse,
           openaiBody.model
         );
+
+        // Override prompt_tokens with pre-summarization count so Cursor sees actual context size
+        if (originalTokenCount > 0 && openaiResponse.usage) {
+          openaiResponse.usage.prompt_tokens = originalTokenCount;
+          openaiResponse.usage.total_tokens = originalTokenCount + openaiResponse.usage.completion_tokens;
+          console.log(`   [Usage] Non-streaming usage override: prompt_tokens=${originalTokenCount}, completion_tokens=${openaiResponse.usage.completion_tokens}`);
+        }
 
         return Response.json(openaiResponse, { headers: responseHeaders });
       } catch (error) {

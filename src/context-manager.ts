@@ -185,7 +185,7 @@ function getContextConfig(): ContextConfig {
       "summarize",
     summarizationModel:
       process.env.CONTEXT_SUMMARIZATION_MODEL || "claude-sonnet-4-5-20250929",
-    // Claude Code OAuth enforces 200K server-side (400: "prompt is too long" above this)
+    // Claude Code OAuth enforces 200K server-side (1M beta not available for OAuth)
     maxTokens: parseInt(process.env.CONTEXT_MAX_TOKENS || "200000"),
     targetTokens: parseInt(process.env.CONTEXT_TARGET_TOKENS || "180000"),
   };
@@ -893,9 +893,17 @@ async function trimToFitContext(
   return result;
 }
 
+export interface ManageContextResult {
+  request: AnthropicRequest;
+  /** Token count BEFORE any summarization/trimming — what Cursor actually sent */
+  originalTokenCount: number;
+}
+
 /**
  * Main entry point: manage context to fit within token limits.
  * Uses summarization (preferred) or trim (fallback).
+ * Returns both the (possibly reduced) request AND the original token count
+ * so callers can report accurate usage to clients like Cursor.
  *
  * Caching is handled inside summarizeContext() - it caches the summary TEXT
  * for specific message ranges, not the full request. This ensures:
@@ -905,9 +913,12 @@ async function trimToFitContext(
  */
 export async function manageContext(
   req: AnthropicRequest
-): Promise<AnthropicRequest> {
+): Promise<ManageContextResult> {
   const config = getContextConfig();
-  if (config.strategy === "none") return req;
+  if (config.strategy === "none") {
+    const estimate = countTokens(req);
+    return { request: req, originalTokenCount: estimate.total };
+  }
 
   // Quick character-based estimate first
   const estimate = countTokens(req);
@@ -941,7 +952,12 @@ export async function manageContext(
     `📊 [Tokens] ~${Math.round(tokenCount / 1000)}K total (${countSource}) | system: ~${Math.round(estimate.system / 1000)}K, messages: ~${Math.round(msgTokensTotal / 1000)}K × ${req.messages.length}, tools: ~${Math.round(estimate.tools / 1000)}K | limit: ${Math.round(config.maxTokens / 1000)}K`
   );
 
-  if (tokenCount < config.maxTokens) return req;
+  // Preserve the ORIGINAL token count before any summarization/trimming
+  const originalTokenCount = tokenCount;
+
+  if (tokenCount < config.maxTokens) {
+    return { request: req, originalTokenCount };
+  }
 
   console.log(
     `\n🔄 [Summarization] Exceeds limit by ~${Math.round((tokenCount - config.maxTokens) / 1000)}K tokens, reducing to ${Math.round(config.targetTokens / 1000)}K target...`
@@ -1002,13 +1018,14 @@ export async function manageContext(
         }
       }
 
-      return result;
+      return { request: result, originalTokenCount };
     } catch (err) {
       console.error(`   ❌ Context management failed:`, err);
       throw err;
     }
   } else if (config.strategy === "trim") {
-    return await trimToFitContext(structuredClone(req), config.targetTokens, config.maxTokens);
+    const trimmed = await trimToFitContext(structuredClone(req), config.targetTokens, config.maxTokens);
+    return { request: trimmed, originalTokenCount };
   }
 
   // Strategy is "none" but we're over limit - shouldn't happen (we returned early)

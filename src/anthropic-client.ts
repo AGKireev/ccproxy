@@ -162,8 +162,8 @@ async function makeClaudeCodeRequestWithOAuth(
       `   [Debug] Request body keys: ${Object.keys(preparedBody).join(", ")}`
     );
 
-    // Use ONLY our Claude Code beta headers - don't merge with Cursor's
-    // Cursor may send incompatible headers like "context-1m-2025-08-07"
+    // Use ONLY our Claude Code beta headers — don't merge with Cursor's
+    // Note: context-1m beta is not available for OAuth subscriptions
     console.log(
       `   [Debug] Using Claude Code beta headers: "${CLAUDE_CODE_BETA_HEADERS}"`
     );
@@ -314,17 +314,10 @@ async function extractUsageFromResponse(
   stream: boolean,
   startTime: number
 ): Promise<Response> {
-  // For streaming, we can't easily extract usage without consuming the stream
-  // Record with zeros and let the client track actual usage
+  // For streaming, the caller (index.ts) captures actual token counts from
+  // message_start/message_delta events and records analytics there.
+  // Don't record zeros here — it would create duplicate entries with wrong data.
   if (stream) {
-    recordRequest({
-      model,
-      source,
-      inputTokens: 0,
-      outputTokens: 0,
-      stream: true,
-      latencyMs: Date.now() - startTime,
-    });
     return response;
   }
 

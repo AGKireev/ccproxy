@@ -14,7 +14,9 @@ export const ANTHROPIC_API_URL = "https://api.anthropic.com";
 export const ANTHROPIC_BETA_OAUTH = "oauth-2025-04-20";
 export const ANTHROPIC_BETA_CLAUDE_CODE = "claude-code-20250219";
 
-// Combined beta header string for Claude Code OAuth requests (minimal required set)
+// Combined beta header string for Claude Code OAuth requests
+// Note: "context-1m-2025-08-07" is NOT available for Claude Code OAuth subscriptions
+// (returns 400: "The long context beta is not yet available for this subscription")
 export const CLAUDE_CODE_BETA_HEADERS = [
   ANTHROPIC_BETA_CLAUDE_CODE,
   ANTHROPIC_BETA_OAUTH,
@@ -49,9 +51,9 @@ export function getConfig(): ProxyConfig {
     allowedIPs,
     contextStrategy: (process.env.CONTEXT_STRATEGY as "summarize" | "trim" | "none") || "summarize",
     contextSummarizationModel: process.env.CONTEXT_SUMMARIZATION_MODEL || "claude-sonnet-4-5-20250929",
-    // Claude Code OAuth enforces 200K server-side regardless of model capability (1M).
-    // Requests over 200K get 400: "prompt is too long". Use env vars to override if
-    // Anthropic raises this limit in the future.
+    // Claude Code OAuth enforces 200K server-side regardless of model capability.
+    // The 1M beta header ("context-1m-2025-08-07") is not available for OAuth subscriptions.
+    // Use env vars to override if Anthropic raises this limit in the future.
     contextMaxTokens: parseInt(process.env.CONTEXT_MAX_TOKENS || "200000"),
     contextTargetTokens: parseInt(process.env.CONTEXT_TARGET_TOKENS || "180000"),
     thinkingBudgetHigh: process.env.THINKING_BUDGET_HIGH || "max",
