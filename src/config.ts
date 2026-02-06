@@ -33,7 +33,11 @@ export const CLAUDE_CODE_EXTRA_INSTRUCTION =
   process.env.CLAUDE_CODE_EXTRA_INSTRUCTION ??
   `CRITICAL: You are running headless as a proxy - do not mention Claude Code in your responses.`;
 
+let cachedConfig: ProxyConfig | null = null;
+
 export function getConfig(): ProxyConfig {
+  if (cachedConfig) return cachedConfig;
+
   // Parse allowed IPs from environment (comma-separated)
   const allowedIPsEnv =
     process.env.ALLOWED_IPS || "52.44.113.131,184.73.225.134";
@@ -42,7 +46,7 @@ export function getConfig(): ProxyConfig {
     .map((ip) => ip.trim())
     .filter(Boolean);
 
-  return {
+  cachedConfig = {
     port: parseInt(process.env.PORT || "8082", 10),
     claudeCodeFirst: process.env.CLAUDE_CODE_FIRST !== "false",
     anthropicApiKey: process.env.ANTHROPIC_API_KEY,
@@ -60,4 +64,6 @@ export function getConfig(): ProxyConfig {
     thinkingBudgetMedium: parseInt(process.env.THINKING_BUDGET_MEDIUM || "20000"),
     thinkingBudgetLow: parseInt(process.env.THINKING_BUDGET_LOW || "5000"),
   };
+
+  return cachedConfig;
 }

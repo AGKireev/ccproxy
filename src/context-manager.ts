@@ -525,7 +525,7 @@ async function summarizeContext(
   config: ContextConfig,
   currentTokenCount: number
 ): Promise<SummarizeResult> {
-  let result = structuredClone(req);
+  let result: AnthropicRequest = JSON.parse(JSON.stringify(req));
   let countSource: "api" | "estimate" = "estimate";
 
   for (let iter = 0; iter < MAX_ITERATIONS; iter++) {
@@ -1024,7 +1024,7 @@ export async function manageContext(
       throw err;
     }
   } else if (config.strategy === "trim") {
-    const trimmed = await trimToFitContext(structuredClone(req), config.targetTokens, config.maxTokens);
+    const trimmed = await trimToFitContext(JSON.parse(JSON.stringify(req)), config.targetTokens, config.maxTokens);
     return { request: trimmed, originalTokenCount };
   }
 

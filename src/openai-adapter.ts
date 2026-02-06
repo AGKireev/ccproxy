@@ -263,7 +263,11 @@ export function openaiToAnthropic(request: OpenAIChatRequest): AnthropicRequest 
       const content =
         typeof msg.content === "string" ? msg.content : (msg.content || []).map((p) => p.text || "").join("\n");
       if (system) {
-        system = typeof system === "string" ? `${system}\n${content}` : system;
+        if (typeof system === "string") {
+          system = `${system}\n${content}`;
+        } else if (Array.isArray(system)) {
+          system.push({ type: "text", text: content } as ContentBlock);
+        }
       } else {
         system = content;
       }

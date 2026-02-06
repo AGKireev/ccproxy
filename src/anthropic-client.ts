@@ -6,12 +6,11 @@ import {
   getConfig,
 } from "./config";
 import { getValidToken, clearCachedToken } from "./oauth";
-import { recordRequest, checkBudget, type RequestSource } from "./db";
 import type { AnthropicRequest, AnthropicError, ContentBlock } from "./types";
 import { logger } from "./logger";
 
 type RequestResult =
-  | { success: true; response: Response; source: RequestSource }
+  | { success: true; response: Response; source: "claude_code" | "api_key" }
   | { success: false; error: string; shouldFallback: boolean };
 
 let rateLimitCache: { resetAt: number } | null = null;
@@ -225,7 +224,7 @@ async function makeClaudeCodeRequestWithOAuth(
     }
 
     if (response.status === 403) {
-      const errorBody = await response.clone().text();
+      const errorBody = await response.text();
       console.log("Claude Code 403 error:", errorBody);
       return {
         success: false,
@@ -237,7 +236,6 @@ async function makeClaudeCodeRequestWithOAuth(
     // Check for API errors in the response body (can happen even with 200 status)
     if (response.status === 400) {
       const errorBody = (await response
-        .clone()
         .json()
         .catch(() => ({}))) as { error?: { message?: string } };
       const errorMessage = errorBody?.error?.message || "";
@@ -304,54 +302,6 @@ async function makeDirectApiRequest(
   }
 }
 
-/**
- * Extract usage from response (for non-streaming)
- */
-async function extractUsageFromResponse(
-  response: Response,
-  model: string,
-  source: RequestSource,
-  stream: boolean,
-  startTime: number
-): Promise<Response> {
-  // For streaming, the caller (index.ts) captures actual token counts from
-  // message_start/message_delta events and records analytics there.
-  // Don't record zeros here — it would create duplicate entries with wrong data.
-  if (stream) {
-    return response;
-  }
-
-  // For non-streaming, clone and parse the response to get usage
-  try {
-    const cloned = response.clone();
-    const data = (await cloned.json()) as {
-      usage?: { input_tokens?: number; output_tokens?: number };
-    };
-    const usage = data.usage || {};
-
-    recordRequest({
-      model,
-      source,
-      inputTokens: usage.input_tokens || 0,
-      outputTokens: usage.output_tokens || 0,
-      stream: false,
-      latencyMs: Date.now() - startTime,
-    });
-  } catch {
-    // If we can't parse, record with zeros
-    recordRequest({
-      model,
-      source,
-      inputTokens: 0,
-      outputTokens: 0,
-      stream: false,
-      latencyMs: Date.now() - startTime,
-    });
-  }
-
-  return response;
-}
-
 export async function proxyRequest(
   endpoint: string,
   body: AnthropicRequest,
@@ -359,9 +309,6 @@ export async function proxyRequest(
   userAPIKey?: string
 ): Promise<Response> {
   const config = getConfig();
-  const startTime = Date.now();
-  const model = body.model;
-  const stream = body.stream || false;
 
   // Always try Claude Code first (if enabled), then fall back to API key
   if (config.claudeCodeFirst) {
@@ -369,25 +316,10 @@ export async function proxyRequest(
 
     if (claudeResult.success) {
       console.log(`✓ Request served via Claude Code`);
-      return extractUsageFromResponse(
-        claudeResult.response,
-        model,
-        claudeResult.source,
-        stream,
-        startTime
-      );
+      return claudeResult.response;
     }
 
     if (!claudeResult.shouldFallback) {
-      recordRequest({
-        model,
-        source: "error",
-        inputTokens: 0,
-        outputTokens: 0,
-        stream,
-        error: claudeResult.error,
-      });
-
       return new Response(
         JSON.stringify({
           type: "error",
@@ -404,27 +336,6 @@ export async function proxyRequest(
     // Prefer user-provided API key, then fall back to config API key
     const fallbackApiKey = userAPIKey || config.anthropicApiKey;
     if (fallbackApiKey) {
-      // Check budget before using API key
-      const budgetError = checkBudget();
-      if (budgetError) {
-        console.log(`⚠ Budget limit reached: ${budgetError}`);
-        recordRequest({
-          model,
-          source: "error",
-          inputTokens: 0,
-          outputTokens: 0,
-          stream,
-          error: budgetError,
-        });
-        return new Response(
-          JSON.stringify({
-            type: "error",
-            error: { type: "rate_limit_error", message: budgetError },
-          } satisfies AnthropicError),
-          { status: 429, headers: { "Content-Type": "application/json" } }
-        );
-      }
-
       const apiKeySource = userAPIKey ? "user-provided" : "configured";
       console.log(
         `↓ Falling back to direct Anthropic API (${apiKeySource} key)`
@@ -440,23 +351,8 @@ export async function proxyRequest(
         console.log(
           `✓ Request served via direct Anthropic API (${apiKeySource} key)`
         );
-        return extractUsageFromResponse(
-          apiResult.response,
-          model,
-          apiResult.source,
-          stream,
-          startTime
-        );
+        return apiResult.response;
       }
-
-      recordRequest({
-        model,
-        source: "error",
-        inputTokens: 0,
-        outputTokens: 0,
-        stream,
-        error: apiResult.error,
-      });
 
       return new Response(
         JSON.stringify({
@@ -481,27 +377,6 @@ export async function proxyRequest(
   }
 
   if (config.anthropicApiKey) {
-    // Check budget before using API key
-    const budgetError = checkBudget();
-    if (budgetError) {
-      console.log(`⚠ Budget limit reached: ${budgetError}`);
-      recordRequest({
-        model,
-        source: "error",
-        inputTokens: 0,
-        outputTokens: 0,
-        stream,
-        error: budgetError,
-      });
-      return new Response(
-        JSON.stringify({
-          type: "error",
-          error: { type: "rate_limit_error", message: budgetError },
-        } satisfies AnthropicError),
-        { status: 429, headers: { "Content-Type": "application/json" } }
-      );
-    }
-
     const apiResult = await makeDirectApiRequest(
       endpoint,
       body,
@@ -509,23 +384,8 @@ export async function proxyRequest(
       config.anthropicApiKey
     );
     if (apiResult.success) {
-      return extractUsageFromResponse(
-        apiResult.response,
-        model,
-        apiResult.source,
-        stream,
-        startTime
-      );
+      return apiResult.response;
     }
-
-    recordRequest({
-      model,
-      source: "error",
-      inputTokens: 0,
-      outputTokens: 0,
-      stream,
-      error: apiResult.error,
-    });
 
     return new Response(
       JSON.stringify({
@@ -535,15 +395,6 @@ export async function proxyRequest(
       { status: 500, headers: { "Content-Type": "application/json" } }
     );
   }
-
-  recordRequest({
-    model,
-    source: "error",
-    inputTokens: 0,
-    outputTokens: 0,
-    stream,
-    error: "No authentication method available",
-  });
 
   return new Response(
     JSON.stringify({

@@ -25,21 +25,6 @@ const LOCK_RETRY_MS = 100;
 const LOCK_MAX_RETRIES = 50; // 5s total wait
 
 function acquireLock(): boolean {
-  // Check for stale lock
-  if (existsSync(LOCK_FILE)) {
-    try {
-      const lockContent = readFileSync(LOCK_FILE, "utf-8");
-      const lockTime = parseInt(lockContent, 10);
-      if (!isNaN(lockTime) && Date.now() - lockTime > LOCK_TIMEOUT_MS) {
-        console.log("⚠ Removing stale credentials lock file");
-        try { unlinkSync(LOCK_FILE); } catch {}
-      }
-    } catch {
-      // Can't read lock file — try to remove it
-      try { unlinkSync(LOCK_FILE); } catch {}
-    }
-  }
-
   try {
     // O_CREAT | O_EXCL = atomic create, fails if file exists
     const fd = openSync(LOCK_FILE, "wx");
@@ -48,6 +33,26 @@ function acquireLock(): boolean {
     writeFileSync(LOCK_FILE, String(Date.now()));
     return true;
   } catch {
+    // Atomic create failed — lock file exists. Check if it's stale.
+    try {
+      const lockContent = readFileSync(LOCK_FILE, "utf-8");
+      const lockTime = parseInt(lockContent, 10);
+      if (!isNaN(lockTime) && Date.now() - lockTime > LOCK_TIMEOUT_MS) {
+        console.log("⚠ Removing stale credentials lock file");
+        try { unlinkSync(LOCK_FILE); } catch {}
+        // Retry atomic create after removing stale lock
+        try {
+          const fd = openSync(LOCK_FILE, "wx");
+          closeSync(fd);
+          writeFileSync(LOCK_FILE, String(Date.now()));
+          return true;
+        } catch {
+          return false; // Another process grabbed it between delete and create
+        }
+      }
+    } catch {
+      // Can't read lock file — another process may be writing it
+    }
     return false; // lock held by another process
   }
 }
@@ -64,8 +69,7 @@ async function withFileLock<T>(fn: () => Promise<T>): Promise<T> {
   while (!(acquired = acquireLock())) {
     retries++;
     if (retries >= LOCK_MAX_RETRIES) {
-      console.error("⚠ Could not acquire credentials lock after 5s, proceeding without lock");
-      break;
+      throw new Error("Could not acquire credentials lock after 5s — another process may be stuck");
     }
     await new Promise((r) => setTimeout(r, LOCK_RETRY_MS));
   }
