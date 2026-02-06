@@ -12,38 +12,50 @@ const COMPRESSION_RATIO = 0.3; // summary is ~30% of original
 const PROTECT_FIRST = 3; // protect first 3 messages (system context, initial instructions)
 const PROTECT_LAST = 10; // protect last 10 messages (recent conversation)
 const MAX_ITERATIONS = 3;
+const MAX_INCREMENTAL_MERGES = 5; // force full re-summarization after N incremental merges (quality compaction)
+const MIN_SUMMARY_CHARS = 200; // absolute minimum summary length
+const SUMMARY_QUALITY_RATIO = 0.005; // summary must be at least 0.5% of estimated input chars
+const INCREMENTAL_MAX_TOKENS = 8192; // smaller max_tokens for incremental merges (delta is small)
 
-// --- Summarization Cache ---
-// Prevents re-summarizing the same messages multiple times.
+// --- Incremental Summarization Cache ---
+// Instead of re-summarizing the entire middle section on every request, we cache the
+// accumulated summary and only process NEW (delta) messages incrementally.
 //
-// STRATEGY: We cache the summary TEXT for a specific set of messages (identified by content hash).
-// This ensures:
-// 1. Same messages to summarize = cache hit (fast, reuse previous summary)
-// 2. Different messages = cache miss (re-summarize to avoid stale data)
+// STRATEGY:
+// 1. Cold start: full summarization of middle messages, cache the result
+// 2. Subsequent requests: detect how many messages are already summarized (via offset),
+//    only call the API to merge the delta (new messages) into the existing summary
+// 3. After MAX_INCREMENTAL_MERGES, force a full re-summarization (quality compaction)
 //
-// LIMITATION: If the conversation grows by adding new messages in the "middle section"
-// (between PROTECT_FIRST and PROTECT_LAST), the cache won't help because we're summarizing
-// a different set of messages. This happens during sequential tool calls where each request
-// has the full original conversation + new tool results.
+// CACHE VALIDATION:
+// - anchorHash: hash of first few middle messages — detects conversation divergence
+// - lastSummarizedMessageHash: hash of boundary message — detects message edits/deletions
+// - If either fails, cache is discarded and we fall back to cold start
 //
 // WHEN CACHE HELPS:
-// - Retries (same request sent again)
-// - Parallel tool calls (same conversation in multiple concurrent requests)
-// - Any case where the exact same messages need summarization
+// - Sequential tool calls in same conversation (incremental merge, ~5s vs ~33s)
+// - Retries (full cache hit, offset matches, ~0s)
+// - Parallel tool calls (full cache hit, same messages)
 
-interface SummarizationCacheEntry {
-  // Hash of the messages that were summarized (the "middle section")
-  summarizedMessagesHash: string;
-  // The summary text that replaced those messages
+interface IncrementalSummaryCache {
+  // The accumulated summary text covering all previously-summarized messages
   summaryText: string;
-  // Number of messages that were summarized
-  summarizedCount: number;
-  // Timestamp for TTL
+  // How many messages from middleStart are covered by this summary
+  summarizedUpToOffset: number;
+  // Hash of the boundary message (last message included in summary) for integrity validation
+  lastSummarizedMessageHash: string;
+  // Hash of first few middle messages — detects conversation divergence
+  anchorHash: string;
+  // Estimated token count of the summary text itself
+  summaryTokens: number;
+  // How many incremental merges have been done (reset on full re-summarization)
+  incrementalMergeCount: number;
+  // Creation timestamp for TTL
   timestamp: number;
 }
 
-const summarizationCache = new Map<string, SummarizationCacheEntry>();
-const CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
+const summarizationCache = new Map<string, IncrementalSummaryCache>();
+const CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes (extended from 15 — conversations can span longer)
 const MAX_CACHE_ENTRIES = 50;
 
 /**
@@ -63,6 +75,61 @@ function getConversationId(req: AnthropicRequest): string {
 function hashMessages(messages: AnthropicMessage[]): string {
   const str = JSON.stringify(messages);
   return Bun.hash(str).toString(16);
+}
+
+/**
+ * Hash a single message for boundary validation.
+ */
+function hashSingleMessage(msg: AnthropicMessage): string {
+  return Bun.hash(JSON.stringify(msg)).toString(16);
+}
+
+/**
+ * Compute anchor hash from the first few middle-section messages.
+ * Used to detect conversation divergence (e.g., messages edited/deleted before our boundary).
+ */
+function computeAnchorHash(messages: AnthropicMessage[], middleStart: number): string {
+  const anchorCount = Math.min(3, messages.length - middleStart);
+  if (anchorCount <= 0) return "";
+  const anchorMessages = messages.slice(middleStart, middleStart + anchorCount);
+  return hashMessages(anchorMessages);
+}
+
+/**
+ * Validate that a summary meets quality thresholds proportional to input size.
+ * Catches near-empty summaries that slip through (e.g., "0K tokens, 100% compression").
+ */
+function validateSummaryQuality(
+  summary: string,
+  inputTokenEstimate: number
+): { valid: boolean; reason?: string } {
+  if (!summary || summary.trim().length === 0) {
+    return { valid: false, reason: "Summary is empty" };
+  }
+
+  // Absolute minimum
+  if (summary.trim().length < MIN_SUMMARY_CHARS) {
+    return {
+      valid: false,
+      reason: `Summary too short: ${summary.trim().length} chars (minimum: ${MIN_SUMMARY_CHARS})`,
+    };
+  }
+
+  // Proportional minimum: summary should be at least 0.5% of estimated input chars
+  const estimatedInputChars = inputTokenEstimate * 3.5;
+  const minChars = Math.max(
+    MIN_SUMMARY_CHARS,
+    Math.floor(estimatedInputChars * SUMMARY_QUALITY_RATIO)
+  );
+
+  if (summary.trim().length < minChars) {
+    return {
+      valid: false,
+      reason: `Summary suspiciously short: ${summary.trim().length} chars for ~${Math.round(inputTokenEstimate / 1000)}K token input (minimum: ${minChars} chars)`,
+    };
+  }
+
+  return { valid: true };
 }
 
 /**
@@ -91,22 +158,14 @@ function cleanupCache(): void {
 }
 
 /**
- * Check if we can reuse a cached summary for this request.
- *
- * CACHING STRATEGY:
- * We cache the summary TEXT for a specific set of messages (identified by content hash).
- * Cache hit only if we're summarizing the EXACT same messages (same content, same count).
- *
- * This is conservative but safe:
- * - Same messages = reuse summary (fast!)
- * - Any change in messages = re-summarize (no stale data)
- *
- * Returns the cached summary info if applicable, null otherwise.
+ * Look up the incremental summary cache for a conversation.
+ * Validates anchor hash and boundary hash to ensure cache integrity.
+ * Returns null if cache is stale, expired, or integrity checks fail.
  */
-function getCachedSummary(
+function getIncrementalCache(
   req: AnthropicRequest,
-  toSummarize: AnthropicMessage[]
-): SummarizationCacheEntry | null {
+  middleStart: number
+): IncrementalSummaryCache | null {
   const conversationId = getConversationId(req);
   const cached = summarizationCache.get(conversationId);
 
@@ -125,49 +184,70 @@ function getCachedSummary(
     return null;
   }
 
-  // Cache hit ONLY if we're summarizing the exact same messages
-  if (toSummarize.length !== cached.summarizedCount) {
+  // Validate anchor: first few middle messages haven't changed
+  const currentAnchor = computeAnchorHash(req.messages, middleStart);
+  if (currentAnchor !== cached.anchorHash) {
     console.log(
-      `📦 [Cache Miss] Message count changed: cached ${cached.summarizedCount} vs current ${toSummarize.length}`
+      `📦 [Cache Invalid] Anchor messages changed (conversation diverged), discarding`
     );
+    summarizationCache.delete(conversationId);
     return null;
   }
 
-  const currentHash = hashMessages(toSummarize);
-  if (currentHash !== cached.summarizedMessagesHash) {
+  // Validate boundary message: the last message we summarized is still the same
+  const boundaryIndex = middleStart + cached.summarizedUpToOffset - 1;
+  if (boundaryIndex < middleStart || boundaryIndex >= req.messages.length) {
     console.log(
-      `📦 [Cache Miss] Message content changed (hash mismatch)`
+      `📦 [Cache Invalid] Boundary index ${boundaryIndex} out of range [${middleStart}..${req.messages.length - 1}], discarding`
     );
+    summarizationCache.delete(conversationId);
+    return null;
+  }
+
+  const currentBoundaryHash = hashSingleMessage(req.messages[boundaryIndex]);
+  if (currentBoundaryHash !== cached.lastSummarizedMessageHash) {
+    console.log(
+      `📦 [Cache Invalid] Boundary message at index ${boundaryIndex} changed (hash mismatch), discarding`
+    );
+    summarizationCache.delete(conversationId);
     return null;
   }
 
   console.log(
-    `📦 [Cache Hit] Reusing cached summary for ${cached.summarizedCount} messages (conv: ${conversationId.slice(0, 8)}...)`
+    `📦 [Cache Hit] Found cached summary covering ${cached.summarizedUpToOffset} messages, ${cached.incrementalMergeCount} merges (conv: ${conversationId.slice(0, 8)}...)`
   );
   return cached;
 }
 
 /**
- * Store a summary in the cache for future reuse.
+ * Store an incremental summary in the cache.
  */
-function cacheSummary(
+function cacheIncrementalSummary(
   req: AnthropicRequest,
-  summarizedMessages: AnthropicMessage[],
-  summaryText: string
+  middleStart: number,
+  summarizedUpToOffset: number,
+  summaryText: string,
+  summaryTokens: number,
+  incrementalMergeCount: number
 ): void {
   const conversationId = getConversationId(req);
-  const messagesHash = hashMessages(summarizedMessages);
+  const anchorHash = computeAnchorHash(req.messages, middleStart);
+  const boundaryIndex = middleStart + summarizedUpToOffset - 1;
+  const lastSummarizedMessageHash = hashSingleMessage(req.messages[boundaryIndex]);
 
   summarizationCache.set(conversationId, {
-    summarizedMessagesHash: messagesHash,
-    summaryText: summaryText,
-    summarizedCount: summarizedMessages.length,
+    summaryText,
+    summarizedUpToOffset,
+    lastSummarizedMessageHash,
+    anchorHash,
+    summaryTokens,
+    incrementalMergeCount,
     timestamp: Date.now(),
   });
 
   cleanupCache();
   console.log(
-    `📦 [Cache Store] Cached summary of ${summarizedMessages.length} messages (conv: ${conversationId.slice(0, 8)}...)`
+    `📦 [Cache Store] Cached summary covering ${summarizedUpToOffset} messages, merge #${incrementalMergeCount} (conv: ${conversationId.slice(0, 8)}...)`
   );
 }
 
@@ -330,6 +410,78 @@ ${transcript}`,
   // Warn if summary was truncated due to max_tokens
   if (data.stop_reason === "max_tokens") {
     console.warn(`   ⚠️ Summary was truncated (hit max_tokens). Consider increasing max_tokens or reducing input.`);
+  }
+
+  return data.content?.[0]?.text || "";
+}
+
+/**
+ * Call the Anthropic API to incrementally merge new messages into an existing summary.
+ * Much faster than full re-summarization since the delta is typically only 2-6 messages.
+ */
+async function callIncrementalSummarizationAPI(
+  existingSummary: string,
+  newMessages: AnthropicMessage[],
+  config: ContextConfig
+): Promise<string> {
+  const token = await getValidToken();
+  if (!token) {
+    throw new Error("No OAuth token available for incremental summarization - run 'claude /login'");
+  }
+
+  const transcript = formatTranscript(newMessages);
+
+  const systemBlocks = [
+    { type: "text", text: CLAUDE_CODE_SYSTEM_PROMPT },
+    {
+      type: "text",
+      text: `You are a conversation summarizer. You will receive an existing summary of a coding conversation and new messages that occurred after the summary. Produce a single COMPLETE updated summary that incorporates both. Preserve ALL technical details: file paths, function signatures, code snippets, error messages, decisions, and resolutions. Be dense and factual. Output only the updated summary.`,
+    },
+  ];
+
+  const response = await fetch(`${ANTHROPIC_API_URL}/v1/messages`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token.accessToken}`,
+      "anthropic-beta": CLAUDE_CODE_BETA_HEADERS,
+      "anthropic-version": "2023-06-01",
+      "Content-Type": "application/json",
+      "User-Agent": "claude-code/1.0.85",
+    },
+    body: JSON.stringify({
+      model: config.summarizationModel,
+      max_tokens: INCREMENTAL_MAX_TOKENS,
+      stream: false,
+      system: systemBlocks,
+      messages: [
+        {
+          role: "user",
+          content: `== EXISTING SUMMARY (covers earlier messages) ==
+
+${existingSummary}
+
+== NEW MESSAGES (added after the summary) ==
+
+${transcript}
+
+Produce a COMPLETE updated summary incorporating both sections. Do not simply append — integrate the new information into a coherent whole. Preserve all technical details: file paths, function signatures, code snippets, error messages, decisions, and resolutions.`,
+        },
+      ],
+    }),
+    signal: AbortSignal.timeout(60_000), // 60s timeout (shorter — delta is small)
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => "unknown");
+    throw new Error(
+      `Incremental summarization API returned ${response.status}: ${errorText}`
+    );
+  }
+
+  const data = (await response.json()) as AnthropicResponse;
+
+  if (data.stop_reason === "max_tokens") {
+    console.warn(`   ⚠️ Incremental summary was truncated (hit max_tokens=${INCREMENTAL_MAX_TOKENS})`);
   }
 
   return data.content?.[0]?.text || "";
@@ -513,8 +665,13 @@ interface SummarizeResult {
 
 /**
  * Summarize selected messages to reduce context size.
- * Uses cache to avoid re-summarizing the same messages on subsequent requests.
- * Returns both the modified request AND the final token count to avoid redundant API calls.
+ * Uses INCREMENTAL summarization: caches the summary and only processes
+ * new (delta) messages on subsequent requests, dramatically reducing latency.
+ *
+ * Flow:
+ * 1. Cold start: full summarization of middle messages, cache result
+ * 2. Cache hit: merge only new (delta) messages into existing summary (~5s vs ~33s)
+ * 3. After MAX_INCREMENTAL_MERGES: force full re-summarization (quality compaction)
  *
  * @param req - The request to summarize
  * @param config - Context configuration
@@ -535,18 +692,10 @@ async function summarizeContext(
       break;
     }
 
-    // Get per-message token counts for selection (estimate is fine for relative sizing)
-    const counts = countTokens(result);
-
-    // Use accurate currentTokenCount for excess calculation
-    const excess = currentTokenCount - config.targetTokens;
-    const tokensToSelect = Math.ceil(excess / (1 - COMPRESSION_RATIO));
-
-    console.log(`   🔄 Need to reduce ${Math.round(excess / 1000)}K tokens, selecting ~${Math.round(tokensToSelect / 1000)}K to summarize`);
-
     const messages = result.messages;
     const middleStart = Math.min(PROTECT_FIRST, messages.length);
     const middleEnd = Math.max(middleStart, messages.length - PROTECT_LAST);
+    const totalMiddle = middleEnd - middleStart;
 
     if (middleStart >= middleEnd) {
       console.log(
@@ -555,72 +704,272 @@ async function summarizeContext(
       break;
     }
 
-    // Accumulate messages from middleStart until we cover tokensToSelect
-    let accumulated = 0;
-    let selectEnd = middleStart;
-    for (let i = middleStart; i < middleEnd && accumulated < tokensToSelect; i++) {
-      accumulated += counts.messages[i];
-      selectEnd = i + 1;
-    }
-
-    // Adjust boundary to avoid orphaning tool pairs (capped at middleEnd)
-    selectEnd = Math.min(adjustBoundary(messages, middleStart, selectEnd), middleEnd);
-
-    const toSummarize = messages.slice(middleStart, selectEnd);
-    if (toSummarize.length === 0) break;
-
-    const summarizeTokens = toSummarize.reduce(
-      (sum, msg) => sum + countMessageTokens(msg),
-      0
-    );
-
-    // Check if we have a cached summary for these exact messages
-    const cached = getCachedSummary(req, toSummarize);
+    // Check for incremental cache (use `result` not `req` — on iteration 2+, result has been modified)
+    const cached = getIncrementalCache(result, middleStart);
     let summary: string;
+    let summarizedUpToOffset: number;
+    let mergeCount: number;
 
-    if (cached) {
-      // CACHE HIT: Reuse the cached summary
-      summary = cached.summaryText;
-      console.log(
-        `   🔄 Reusing cached summary for ${toSummarize.length} messages (~${Math.round(summarizeTokens / 1000)}K tokens)`
-      );
+    if (cached && cached.summarizedUpToOffset > 0) {
+      // === INCREMENTAL PATH ===
+      const alreadySummarized = cached.summarizedUpToOffset;
+
+      if (alreadySummarized >= totalMiddle) {
+        // Full cache hit: all middle messages already summarized
+        summary = cached.summaryText;
+        summarizedUpToOffset = totalMiddle; // Cap to actual middle range (don't exceed into protected zone)
+        mergeCount = cached.incrementalMergeCount;
+        console.log(
+          `   🔄 [Full Cache Hit] All ${alreadySummarized} middle messages already summarized, reusing (~0s)`
+        );
+      } else if (cached.incrementalMergeCount >= MAX_INCREMENTAL_MERGES) {
+        // Quality compaction: too many incremental merges, force full re-summarization
+        console.log(
+          `   🔄 [Compaction] Merge count ${cached.incrementalMergeCount} >= ${MAX_INCREMENTAL_MERGES}, forcing full re-summarization`
+        );
+
+        // Summarize ALL middle messages
+        let selectEnd = Math.min(
+          adjustBoundary(messages, middleStart, middleEnd),
+          middleEnd
+        );
+        const toSummarize = messages.slice(middleStart, selectEnd);
+        if (toSummarize.length === 0) break;
+
+        const summarizeTokens = toSummarize.reduce(
+          (sum, msg) => sum + countMessageTokens(msg),
+          0
+        );
+
+        console.log(
+          `   🔄 Full re-summarizing ${toSummarize.length} messages (~${Math.round(summarizeTokens / 1000)}K tokens)`
+        );
+        console.log(`   🔄 Calling ${config.summarizationModel}...`);
+
+        const startTime = Date.now();
+        summary = await callSummarizationAPI(toSummarize, config);
+        const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+
+        const quality = validateSummaryQuality(summary, summarizeTokens);
+        if (!quality.valid) {
+          throw new Error(`Compaction summarization quality check failed: ${quality.reason}`);
+        }
+
+        const summaryTokensEst = Math.ceil(summary.length / 3.5);
+        console.log(
+          `   🔄 Summary: ~${Math.round(summaryTokensEst / 1000)}K tokens (${Math.round((1 - summaryTokensEst / summarizeTokens) * 100)}% compression) in ${elapsed}s`
+        );
+
+        summarizedUpToOffset = selectEnd - middleStart;
+        mergeCount = 0; // Reset merge count after compaction
+      } else {
+        // Incremental merge: summarize only the delta (new messages since last cache)
+        const deltaStart = middleStart + alreadySummarized;
+        let deltaEnd = Math.min(
+          adjustBoundary(messages, deltaStart, middleEnd),
+          middleEnd
+        );
+
+        const deltaMessages = messages.slice(deltaStart, deltaEnd);
+
+        // Safety check: if the delta is very large, it means the cold start only
+        // partially summarized (by token budget) and there are many unsummarized old
+        // messages. In this case, don't use the incremental API — fall through to
+        // cold start which handles token-budget-based selection properly.
+        const MAX_INCREMENTAL_DELTA = 30; // max messages for incremental merge
+        const deltaTokens = deltaMessages.reduce(
+          (sum, msg) => sum + countMessageTokens(msg),
+          0
+        );
+
+        if (deltaMessages.length === 0) {
+          // No new messages to merge
+          summary = cached.summaryText;
+          summarizedUpToOffset = alreadySummarized;
+          mergeCount = cached.incrementalMergeCount;
+          console.log(`   🔄 [Incremental] No new messages to merge, reusing cached summary`);
+        } else if (deltaMessages.length > MAX_INCREMENTAL_DELTA || deltaTokens > 40000) {
+          // Delta too large for incremental merge — discard cache and use cold start
+          // This happens when the previous cold start only partially summarized (token budget)
+          // and there are many unsummarized messages remaining.
+          console.log(
+            `   🔄 [Incremental] Delta too large (${deltaMessages.length} messages, ~${Math.round(deltaTokens / 1000)}K tokens) for incremental merge, using cold start instead`
+          );
+          // Null out cached so we fall through to the cold start below
+          // We need to break out of the incremental path — use a flag
+          // Re-run as cold start by computing token-budget-based selection
+          const counts = countTokens(result);
+          const excess = currentTokenCount - config.targetTokens;
+          const tokensToSelect = Math.ceil(excess / (1 - COMPRESSION_RATIO));
+
+          let accumulated = 0;
+          let selectEnd = middleStart;
+          for (let i = middleStart; i < middleEnd && accumulated < tokensToSelect; i++) {
+            accumulated += counts.messages[i];
+            selectEnd = i + 1;
+          }
+          selectEnd = Math.min(adjustBoundary(messages, middleStart, selectEnd), middleEnd);
+
+          const toSummarize = messages.slice(middleStart, selectEnd);
+          if (toSummarize.length === 0) break;
+
+          const summarizeTokens = toSummarize.reduce(
+            (sum, msg) => sum + countMessageTokens(msg),
+            0
+          );
+
+          console.log(
+            `   🔄 [Cold Start Fallback] Summarizing ${toSummarize.length} messages (~${Math.round(summarizeTokens / 1000)}K tokens)`
+          );
+          console.log(`   🔄 Calling ${config.summarizationModel}...`);
+
+          const startTime = Date.now();
+          summary = await callSummarizationAPI(toSummarize, config);
+          const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+
+          const quality = validateSummaryQuality(summary, summarizeTokens);
+          if (!quality.valid) {
+            throw new Error(`Summarization quality check failed: ${quality.reason}`);
+          }
+
+          const summaryTokensEst = Math.ceil(summary.length / 3.5);
+          console.log(
+            `   🔄 Summary: ~${Math.round(summaryTokensEst / 1000)}K tokens (${Math.round((1 - summaryTokensEst / summarizeTokens) * 100)}% compression) in ${elapsed}s`
+          );
+
+          summarizedUpToOffset = selectEnd - middleStart;
+          mergeCount = 0;
+        } else {
+          console.log(
+            `   🔄 [Incremental] Merging ${deltaMessages.length} new messages (~${Math.round(deltaTokens / 1000)}K tokens) into existing summary (merge #${cached.incrementalMergeCount + 1})`
+          );
+          console.log(`   🔄 Calling ${config.summarizationModel} (incremental)...`);
+
+          const startTime = Date.now();
+          summary = await callIncrementalSummarizationAPI(
+            cached.summaryText,
+            deltaMessages,
+            config
+          );
+          const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+
+          // Quality check: use combined token estimate (existing summary + delta)
+          const combinedTokenEstimate = cached.summaryTokens + deltaTokens;
+          const quality = validateSummaryQuality(summary, combinedTokenEstimate);
+
+          if (!quality.valid) {
+            // Incremental merge produced bad result — fallback to full re-summarization
+            console.warn(
+              `   ⚠️ [Incremental] Quality check failed (${quality.reason}), falling back to full re-summarization`
+            );
+
+            const allMiddle = messages.slice(middleStart, middleEnd);
+            const allMiddleTokens = allMiddle.reduce(
+              (sum, msg) => sum + countMessageTokens(msg),
+              0
+            );
+
+            console.log(`   🔄 Calling ${config.summarizationModel} (full fallback)...`);
+            const fbStartTime = Date.now();
+            summary = await callSummarizationAPI(allMiddle, config);
+            const fbElapsed = ((Date.now() - fbStartTime) / 1000).toFixed(1);
+
+            const fbQuality = validateSummaryQuality(summary, allMiddleTokens);
+            if (!fbQuality.valid) {
+              throw new Error(
+                `Full fallback summarization quality check failed: ${fbQuality.reason}`
+              );
+            }
+
+            const fbSummaryTokens = Math.ceil(summary.length / 3.5);
+            console.log(
+              `   🔄 Summary (fallback): ~${Math.round(fbSummaryTokens / 1000)}K tokens (${Math.round((1 - fbSummaryTokens / allMiddleTokens) * 100)}% compression) in ${fbElapsed}s`
+            );
+
+            summarizedUpToOffset = middleEnd - middleStart;
+            mergeCount = 0;
+          } else {
+            const summaryTokensEst = Math.ceil(summary.length / 3.5);
+            console.log(
+              `   🔄 [Incremental] Merged: ~${Math.round(summaryTokensEst / 1000)}K tokens in ${elapsed}s`
+            );
+            summarizedUpToOffset = deltaEnd - middleStart;
+            mergeCount = cached.incrementalMergeCount + 1;
+          }
+        }
+      }
     } else {
-      // CACHE MISS: Need to call API
+      // === COLD START: Full summarization (same as original behavior) ===
+      const counts = countTokens(result);
+      const excess = currentTokenCount - config.targetTokens;
+      const tokensToSelect = Math.ceil(excess / (1 - COMPRESSION_RATIO));
+
       console.log(
-        `   🔄 Selecting ${toSummarize.length} messages (~${Math.round(summarizeTokens / 1000)}K tokens) for summarization`
+        `   🔄 Need to reduce ${Math.round(excess / 1000)}K tokens, selecting ~${Math.round(tokensToSelect / 1000)}K to summarize`
       );
+
+      // Accumulate messages from middleStart until we cover tokensToSelect
+      let accumulated = 0;
+      let selectEnd = middleStart;
+      for (let i = middleStart; i < middleEnd && accumulated < tokensToSelect; i++) {
+        accumulated += counts.messages[i];
+        selectEnd = i + 1;
+      }
+
+      // Adjust boundary to avoid orphaning tool pairs (capped at middleEnd)
+      selectEnd = Math.min(adjustBoundary(messages, middleStart, selectEnd), middleEnd);
+
+      const toSummarize = messages.slice(middleStart, selectEnd);
+      if (toSummarize.length === 0) break;
+
+      const summarizeTokens = toSummarize.reduce(
+        (sum, msg) => sum + countMessageTokens(msg),
+        0
+      );
+
       console.log(
-        `   🔄 Calling ${config.summarizationModel}...`
+        `   🔄 [Cold Start] Summarizing ${toSummarize.length} messages (~${Math.round(summarizeTokens / 1000)}K tokens)`
       );
+      console.log(`   🔄 Calling ${config.summarizationModel}...`);
 
       const startTime = Date.now();
       summary = await callSummarizationAPI(toSummarize, config);
       const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
 
-      // Validate summary is not empty
-      if (!summary || summary.trim().length < 50) {
-        throw new Error(`Summarization returned empty or too short result (${summary?.length || 0} chars)`);
+      const quality = validateSummaryQuality(summary, summarizeTokens);
+      if (!quality.valid) {
+        throw new Error(`Summarization quality check failed: ${quality.reason}`);
       }
 
-      const summaryTokens = Math.ceil(summary.length / 3.5);
-
+      const summaryTokensEst = Math.ceil(summary.length / 3.5);
       console.log(
-        `   🔄 Summary: ~${Math.round(summaryTokens / 1000)}K tokens (${Math.round((1 - summaryTokens / summarizeTokens) * 100)}% compression) in ${elapsed}s`
+        `   🔄 Summary: ~${Math.round(summaryTokensEst / 1000)}K tokens (${Math.round((1 - summaryTokensEst / summarizeTokens) * 100)}% compression) in ${elapsed}s`
       );
 
-      // Cache the summary for future requests
-      cacheSummary(req, toSummarize, summary);
+      summarizedUpToOffset = selectEnd - middleStart;
+      mergeCount = 0;
     }
 
-    // Replace selected messages with summary pair
+    // Cache the result for future incremental use (use `result` not `req` — matches what getIncrementalCache validates against)
+    cacheIncrementalSummary(
+      result,
+      middleStart,
+      summarizedUpToOffset,
+      summary,
+      Math.ceil(summary.length / 3.5),
+      mergeCount
+    );
+
+    // Replace summarized messages with summary pair
+    const replaceEnd = middleStart + summarizedUpToOffset;
     const before = messages.slice(0, middleStart);
-    const after = messages.slice(selectEnd);
+    const after = messages.slice(replaceEnd);
 
     result.messages = [
       ...before,
       {
         role: "user" as const,
-        content: `[Context Summary - ${toSummarize.length} messages summarized]\n\n${summary}`,
+        content: `[Context Summary - ${summarizedUpToOffset} messages summarized]\n\n${summary}`,
       },
       {
         role: "assistant" as const,
@@ -634,12 +983,12 @@ async function summarizeContext(
     result.messages = cleanupOrphanedToolPairs(result.messages);
 
     // Get accurate token count after summarization
-    const estimate = countTokens(result);
+    const postEstimate = countTokens(result);
     let newTokenCount: number;
 
     // If estimate is still near the limit, get accurate API count
-    if (estimate.total >= config.targetTokens * 0.9) {
-      console.log(`   🔄 Re-counting tokens via API (estimate ~${Math.round(estimate.total / 1000)}K)...`);
+    if (postEstimate.total >= config.targetTokens * 0.9) {
+      console.log(`   🔄 Re-counting tokens via API (estimate ~${Math.round(postEstimate.total / 1000)}K)...`);
       const apiResult = await countTokensAPI(result);
       newTokenCount = apiResult.inputTokens;
       countSource = apiResult.source;
@@ -647,7 +996,7 @@ async function summarizeContext(
         console.log(`   🔄 API count: ${Math.round(newTokenCount / 1000)}K tokens`);
       }
     } else {
-      newTokenCount = estimate.total;
+      newTokenCount = postEstimate.total;
       countSource = "estimate";
     }
 
@@ -905,11 +1254,11 @@ export interface ManageContextResult {
  * Returns both the (possibly reduced) request AND the original token count
  * so callers can report accurate usage to clients like Cursor.
  *
- * Caching is handled inside summarizeContext() - it caches the summary TEXT
- * for specific message ranges, not the full request. This ensures:
- * - Same messages being summarized = reuse cached summary (fast!)
- * - New messages added = only new content triggers re-summarization
- * - Different content = no stale data returned
+ * Caching uses INCREMENTAL summarization inside summarizeContext():
+ * - Cold start: full summarization, result cached with offset
+ * - Subsequent requests: only new (delta) messages merged into cached summary (~5s vs ~33s)
+ * - After MAX_INCREMENTAL_MERGES: full re-summarization for quality compaction
+ * - Integrity validated via anchor hash + boundary hash
  */
 export async function manageContext(
   req: AnthropicRequest
