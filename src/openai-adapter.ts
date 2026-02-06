@@ -6,7 +6,7 @@
 import type { AnthropicRequest, AnthropicMessage, ContentBlock } from "./types";
 import { translateToolCalls, needsTranslation } from "./tool-call-translator";
 import { logger } from "./logger";
-import { getConfig } from "./config";
+
 
 export interface OpenAIMessage {
   role: "system" | "user" | "assistant" | "tool";
@@ -433,26 +433,16 @@ export function openaiToAnthropic(request: OpenAIChatRequest): AnthropicRequest 
     result.tool_choice = request.tool_choice as unknown as typeof result.tool_choice;
   }
 
-  // Add extended thinking if reasoning budget is specified
+  // Add adaptive thinking if reasoning budget suffix is present
+  // Opus 4.6: adaptive thinking — Claude dynamically decides how much to think
   if (normalized.reasoningBudget) {
-    const config = getConfig();
-
-    // Ensure max_tokens is large enough for thinking (Cursor often sends 4096)
-    const MIN_THINKING_MAX_TOKENS = 64000; // All 4.5 models cap at 64K output
+    const MIN_THINKING_MAX_TOKENS = 128000; // Opus 4.6 supports 128K output tokens
     if (result.max_tokens < MIN_THINKING_MAX_TOKENS) {
-      console.log(`   [Debug] Bumping max_tokens from ${result.max_tokens} to ${MIN_THINKING_MAX_TOKENS} for extended thinking`);
+      console.log(`   [Debug] Bumping max_tokens from ${result.max_tokens} to ${MIN_THINKING_MAX_TOKENS} for adaptive thinking`);
       result.max_tokens = MIN_THINKING_MAX_TOKENS;
     }
 
-    const budgetMap: Record<string, string | number> = {
-      max: "max",
-      high: config.thinkingBudgetHigh,
-      medium: config.thinkingBudgetMedium,
-      low: config.thinkingBudgetLow,
-    };
-    const raw = budgetMap[normalized.reasoningBudget] ?? config.thinkingBudgetHigh;
-    const budgetTokens = raw === "max" ? result.max_tokens - 1 : Number(raw);
-    result.thinking = { type: "enabled", budget_tokens: budgetTokens };
+    result.thinking = { type: "adaptive" };
 
     // Anthropic constraints when thinking is enabled:
     // - temperature must be unset (defaults to 1)
@@ -474,7 +464,7 @@ export function openaiToAnthropic(request: OpenAIChatRequest): AnthropicRequest 
       result.stream = true;
     }
 
-    console.log(`   [Debug] Extended thinking: budget_tokens=${budgetTokens}, max_tokens=${result.max_tokens}`);
+    console.log(`   [Debug] Adaptive thinking: max_tokens=${result.max_tokens} (Cursor budget hint: ${normalized.reasoningBudget})`);
   }
 
   return result;

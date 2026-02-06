@@ -15,13 +15,14 @@ export const ANTHROPIC_BETA_OAUTH = "oauth-2025-04-20";
 export const ANTHROPIC_BETA_CLAUDE_CODE = "claude-code-20250219";
 
 // Combined beta header string for Claude Code OAuth requests
-// Note: "context-1m-2025-08-07" is NOT available for Claude Code OAuth subscriptions
-// (returns 400: "The long context beta is not yet available for this subscription")
-export const CLAUDE_CODE_BETA_HEADERS = [
+// - interleaved-thinking-2025-05-14: REMOVED (deprecated on Opus 4.6, auto-enabled)
+// - context-1m-2025-08-07: optional, set ENABLE_1M_CONTEXT=true to test
+const BETA_HEADERS_LIST = [
   ANTHROPIC_BETA_CLAUDE_CODE,
   ANTHROPIC_BETA_OAUTH,
-  "interleaved-thinking-2025-05-14",
-].join(",");
+  ...(process.env.ENABLE_1M_CONTEXT === "true" ? ["context-1m-2025-08-07"] : []),
+];
+export const CLAUDE_CODE_BETA_HEADERS = BETA_HEADERS_LIST.join(",");
 
 // System prompt prefix that identifies requests as coming from Claude Code
 // This exact string is required for Claude Code OAuth to work - do not modify
@@ -55,14 +56,12 @@ export function getConfig(): ProxyConfig {
     allowedIPs,
     contextStrategy: (process.env.CONTEXT_STRATEGY as "summarize" | "trim" | "none") || "summarize",
     contextSummarizationModel: process.env.CONTEXT_SUMMARIZATION_MODEL || "claude-sonnet-4-5-20250929",
-    // Claude Code OAuth enforces 200K server-side regardless of model capability.
-    // The 1M beta header ("context-1m-2025-08-07") is not available for OAuth subscriptions.
-    // Use env vars to override if Anthropic raises this limit in the future.
-    contextMaxTokens: parseInt(process.env.CONTEXT_MAX_TOKENS || "200000"),
-    contextTargetTokens: parseInt(process.env.CONTEXT_TARGET_TOKENS || "180000"),
-    thinkingBudgetHigh: process.env.THINKING_BUDGET_HIGH || "max",
-    thinkingBudgetMedium: parseInt(process.env.THINKING_BUDGET_MEDIUM || "20000"),
-    thinkingBudgetLow: parseInt(process.env.THINKING_BUDGET_LOW || "5000"),
+    // Default 200K (OAuth enforced). Set ENABLE_1M_CONTEXT=true + env vars to test 1M.
+    contextMaxTokens: parseInt(process.env.CONTEXT_MAX_TOKENS ||
+      (process.env.ENABLE_1M_CONTEXT === "true" ? "1000000" : "200000")),
+    contextTargetTokens: parseInt(process.env.CONTEXT_TARGET_TOKENS ||
+      (process.env.ENABLE_1M_CONTEXT === "true" ? "900000" : "180000")),
+    // thinkingBudget* REMOVED — Opus 4.6 uses adaptive thinking (self-regulating)
   };
 
   return cachedConfig;
