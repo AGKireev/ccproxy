@@ -122,7 +122,7 @@ export interface OpenAIStreamChunk {
  * - claude-4.5-haiku → claude-haiku-4-5
  * - claude-4.6-opus-high → claude-opus-4-6 (with reasoning_budget: high)
  */
-export function normalizeModelName(model: string): { model: string; reasoningBudget?: string } {
+export function normalizeModelName(model: string): { model: string; reasoningBudget?: string; minorVersion?: number } {
   // Handle Cursor's format: claude-4.{minor}-{model}-{budget} or claude-4.{minor}-{model}-{budget}-thinking
   const match = model.match(/^claude-4\.(\d+)-(opus|sonnet|haiku)(?:-(high|medium|low|max))?(?:-thinking)?$/);
   if (match) {
@@ -130,12 +130,14 @@ export function normalizeModelName(model: string): { model: string; reasoningBud
     return {
       model: `claude-${modelType}-4-${minor}`,
       reasoningBudget: budget || undefined,
+      minorVersion: parseInt(minor),
     };
   }
 
-  // Handle Anthropic format directly (passthrough)
+  // Handle Anthropic format directly (passthrough) — try to extract version
+  const versionMatch = model.match(/claude-\w+-4-(\d+)/);
   if (model.startsWith("claude-")) {
-    return { model };
+    return { model, minorVersion: versionMatch ? parseInt(versionMatch[1]) : undefined };
   }
 
   // Unknown format, passthrough
@@ -433,16 +435,38 @@ export function openaiToAnthropic(request: OpenAIChatRequest): AnthropicRequest 
     result.tool_choice = request.tool_choice as unknown as typeof result.tool_choice;
   }
 
-  // Add adaptive thinking if reasoning budget suffix is present
-  // Opus 4.6: adaptive thinking — Claude dynamically decides how much to think
+  // Add extended thinking if reasoning budget suffix is present
   if (normalized.reasoningBudget) {
-    const MIN_THINKING_MAX_TOKENS = 128000; // Opus 4.6 supports 128K output tokens
-    if (result.max_tokens < MIN_THINKING_MAX_TOKENS) {
-      console.log(`   [Debug] Bumping max_tokens from ${result.max_tokens} to ${MIN_THINKING_MAX_TOKENS} for adaptive thinking`);
-      result.max_tokens = MIN_THINKING_MAX_TOKENS;
-    }
+    // Opus 4.6+: adaptive thinking (Claude dynamically decides how much to think)
+    // Older models (4.5 and below): enabled thinking with explicit budget_tokens
+    const supportsAdaptive = (normalized.minorVersion ?? 0) >= 6;
 
-    result.thinking = { type: "adaptive" };
+    if (supportsAdaptive) {
+      const MIN_THINKING_MAX_TOKENS = 128000; // Opus 4.6 supports 128K output
+      if (result.max_tokens < MIN_THINKING_MAX_TOKENS) {
+        console.log(`   [Debug] Bumping max_tokens from ${result.max_tokens} to ${MIN_THINKING_MAX_TOKENS} for adaptive thinking`);
+        result.max_tokens = MIN_THINKING_MAX_TOKENS;
+      }
+      result.thinking = { type: "adaptive" };
+      console.log(`   [Debug] Adaptive thinking: max_tokens=${result.max_tokens} (Cursor budget hint: ${normalized.reasoningBudget})`);
+    } else {
+      const MIN_THINKING_MAX_TOKENS = 64000; // 4.5 models cap at 64K output
+      if (result.max_tokens < MIN_THINKING_MAX_TOKENS) {
+        console.log(`   [Debug] Bumping max_tokens from ${result.max_tokens} to ${MIN_THINKING_MAX_TOKENS} for extended thinking`);
+        result.max_tokens = MIN_THINKING_MAX_TOKENS;
+      }
+      // Budget levels for legacy enabled thinking
+      const budgetMap: Record<string, number | "max"> = {
+        max: "max",
+        high: 50000,
+        medium: 20000,
+        low: 5000,
+      };
+      const raw = budgetMap[normalized.reasoningBudget] ?? "max";
+      const budgetTokens = raw === "max" ? result.max_tokens - 1 : raw;
+      result.thinking = { type: "enabled", budget_tokens: budgetTokens };
+      console.log(`   [Debug] Extended thinking: budget_tokens=${budgetTokens}, max_tokens=${result.max_tokens} (legacy, model v4.${normalized.minorVersion})`);
+    }
 
     // Anthropic constraints when thinking is enabled:
     // - temperature must be unset (defaults to 1)
@@ -463,8 +487,6 @@ export function openaiToAnthropic(request: OpenAIChatRequest): AnthropicRequest 
       console.log(`   [Debug] Forcing stream=true (required for max_tokens=${result.max_tokens} with thinking)`);
       result.stream = true;
     }
-
-    console.log(`   [Debug] Adaptive thinking: max_tokens=${result.max_tokens} (Cursor budget hint: ${normalized.reasoningBudget})`);
   }
 
   return result;

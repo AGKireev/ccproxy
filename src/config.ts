@@ -15,11 +15,12 @@ export const ANTHROPIC_BETA_OAUTH = "oauth-2025-04-20";
 export const ANTHROPIC_BETA_CLAUDE_CODE = "claude-code-20250219";
 
 // Combined beta header string for Claude Code OAuth requests
-// - interleaved-thinking-2025-05-14: REMOVED (deprecated on Opus 4.6, auto-enabled)
+// - interleaved-thinking-2025-05-14: deprecated on Opus 4.6 (auto-enabled), still needed for 4.5
 // - context-1m-2025-08-07: optional, set ENABLE_1M_CONTEXT=true to test
 const BETA_HEADERS_LIST = [
   ANTHROPIC_BETA_CLAUDE_CODE,
   ANTHROPIC_BETA_OAUTH,
+  "interleaved-thinking-2025-05-14",
   ...(process.env.ENABLE_1M_CONTEXT === "true" ? ["context-1m-2025-08-07"] : []),
 ];
 export const CLAUDE_CODE_BETA_HEADERS = BETA_HEADERS_LIST.join(",");
