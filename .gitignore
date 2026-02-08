@@ -1,0 +1,40 @@
+# dependencies (bun install)
+node_modules
+
+# output
+out
+dist
+*.tgz
+
+# code coverage
+coverage
+*.lcov
+**/*.db
+# logs
+logs
+_.log
+api.log
+report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
+.claude
+
+# dotenv environment variable files
+.env
+.env.development.local
+.env.test.local
+.env.production.local
+.env.local
+
+# caches
+.eslintcache
+.cache
+*.tsbuildinfo
+
+# IntelliJ based IDEs
+.idea
+
+# Finder (MacOS) folder config
+.DS_Store
+
+# Local config files with credentials
+cloudflared-config.yml
+start-proxy*
