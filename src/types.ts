@@ -118,8 +118,7 @@ export interface ProxyConfig {
   openaiApiKey?: string;
   openaiBaseUrl: string;
   allowedIPs: string[];
-  contextStrategy: "summarize" | "trim" | "none";
-  contextSummarizationModel: string;
-  contextMaxTokens: number;
-  contextTargetTokens: number;
+  compactionEnabled: boolean;
+  compactionTriggerTokens: number;
+  tokenInflationEnabled: boolean;
 }

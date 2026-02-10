@@ -16,6 +16,7 @@ import {
   translateToolCalls,
 } from "./tool-call-translator";
 import { logger } from "./logger";
+import { getConfig } from "./config";
 
 export interface StreamOptions {
   streamId: string;
@@ -55,6 +56,7 @@ export function createAnthropicToOpenAIStream(
       let toolCallIndex = 0;
       let streamInputTokens = 0;
       let streamOutputTokens = 0;
+      let compactionOccurred = false;
       let currentToolCall: {
         id: string;
         name: string;
@@ -181,17 +183,12 @@ export function createAnthropicToOpenAIStream(
                   continue;
                 }
 
-                // Handle compaction blocks — Cursor's native context management
+                // Handle compaction blocks — server-side context summarization
+                // The actual compaction content arrives via compaction_delta events,
+                // so we only set the flag here and log. Content forwarding happens below.
                 if (block?.type === "compaction") {
-                  console.log(`   [Debug] Compaction block received — forwarding to client`);
-                  const content = block.content || block.text || "";
-                  if (content) {
-                    safeEnqueue(
-                      new TextEncoder().encode(
-                        createOpenAIStreamChunk(streamId, openaiModel, content)
-                      )
-                    );
-                  }
+                  compactionOccurred = true;
+                  console.log(`   [Compaction] ⚡ Compaction block started — context is being summarized by API`);
                   continue;
                 }
 
@@ -284,18 +281,18 @@ export function createAnthropicToOpenAIStream(
                 continue;
               }
 
-              // Handle compaction_delta — forward to client
+              // Handle compaction_delta — log only, do NOT forward to client.
+              // The compaction summary is the API's internal mechanism for reducing context.
+              // Forwarding it to Cursor would cause it to accumulate as regular assistant text,
+              // inflating the conversation payload on every subsequent request.
               if (
                 event.type === "content_block_delta" &&
                 event.delta?.type === "compaction_delta"
               ) {
+                compactionOccurred = true;
                 const content = event.delta.content || "";
                 if (content) {
-                  safeEnqueue(
-                    new TextEncoder().encode(
-                      createOpenAIStreamChunk(streamId, openaiModel, content)
-                    )
-                  );
+                  console.log(`   [Compaction] Compaction delta: ${content.length} chars (not forwarded to client)`);
                 }
                 continue;
               }
@@ -658,7 +655,16 @@ export function createAnthropicToOpenAIStream(
                 );
 
                 // Emit usage chunk
-                const reportedPromptTokens = originalTokenCount > 0 ? originalTokenCount : streamInputTokens;
+                // TOKEN INFLATION: Only needed when Cursor shows 872K denominator (MAX Mode ON).
+                // With MAX Mode OFF, Cursor shows 200K which matches OAuth cap — no inflation needed.
+                // When enabled: inflates prompt_tokens so context bar fills proportionally (872K/200K ≈ 4.36).
+                // NOTE: Cursor recalculates tokens locally after each response, so inflation only affects
+                // the live display during thinking/streaming. Cosmetic only — not a summarization trigger.
+                const inflationConfig = getConfig();
+                const TOKEN_INFLATION_ENABLED = inflationConfig.tokenInflationEnabled;
+                const TOKEN_INFLATION_FACTOR = TOKEN_INFLATION_ENABLED ? (872000 / 200000) : 1; // 4.36 if enabled, 1 if disabled
+                const rawPromptTokens = originalTokenCount > 0 ? originalTokenCount : streamInputTokens;
+                const reportedPromptTokens = Math.round(rawPromptTokens * TOKEN_INFLATION_FACTOR);
                 safeEnqueue(
                   new TextEncoder().encode(
                     createOpenAIStreamUsageChunk(
@@ -669,7 +675,13 @@ export function createAnthropicToOpenAIStream(
                     )
                   )
                 );
-                console.log(`   [Usage] Streaming usage: prompt_tokens=${reportedPromptTokens} (original=${originalTokenCount}, anthropic=${streamInputTokens}), completion_tokens=${streamOutputTokens}`);
+                const inflationLabel = TOKEN_INFLATION_ENABLED ? `inflated x${TOKEN_INFLATION_FACTOR.toFixed(2)}` : 'no inflation';
+                console.log(`   [Usage] Streaming usage: prompt_tokens=${reportedPromptTokens} (raw=${rawPromptTokens}, ${inflationLabel}, anthropic=${streamInputTokens}), completion_tokens=${streamOutputTokens}`);
+                if (compactionOccurred) {
+                  console.log(`   [Compaction] ✓ Context was compacted in this response.`);
+                  console.log(`   [Compaction]   API input_tokens after compaction: ${streamInputTokens} (compacted from ~${Math.round(rawPromptTokens / 1000)}K estimated)`);
+                  console.log(`   [Compaction]   ⚠️  Cursor still holds full history — next request will re-send all messages → may re-compact`);
+                }
 
                 safeEnqueue(
                   new TextEncoder().encode("data: [DONE]\n\n")
@@ -762,13 +774,23 @@ export async function handleNonStreamingResponse(
   }
 
   const anthropicResponse = await response.json();
+
+  // Log compaction if it occurred in non-streaming response
+  if (anthropicResponse.content?.some((b: any) => b.type === "compaction")) {
+    console.log(`   [Compaction] ⚡ Compaction occurred in non-streaming response — context was summarized by API`);
+  }
+
   const openaiResponse = anthropicToOpenai(anthropicResponse, openaiModel);
 
-  // Override prompt_tokens with pre-summarization count so Cursor sees actual context size
+  // TOKEN INFLATION: Only needed for MAX Mode ON (872K denominator).
+  // With MAX Mode OFF (200K denominator), raw tokens are already truthful.
   if (originalTokenCount > 0 && openaiResponse.usage) {
-    openaiResponse.usage.prompt_tokens = originalTokenCount;
-    openaiResponse.usage.total_tokens = originalTokenCount + openaiResponse.usage.completion_tokens;
-    console.log(`   [Usage] Non-streaming usage override: prompt_tokens=${originalTokenCount}, completion_tokens=${openaiResponse.usage.completion_tokens}`);
+    const config = getConfig();
+    const TOKEN_INFLATION_FACTOR = config.tokenInflationEnabled ? (872000 / 200000) : 1;
+    const inflated = Math.round(originalTokenCount * TOKEN_INFLATION_FACTOR);
+    openaiResponse.usage.prompt_tokens = inflated;
+    openaiResponse.usage.total_tokens = inflated + openaiResponse.usage.completion_tokens;
+    console.log(`   [Usage] Non-streaming usage: prompt_tokens=${inflated} (raw=${originalTokenCount}${TOKEN_INFLATION_FACTOR > 1 ? `, inflated x${TOKEN_INFLATION_FACTOR.toFixed(2)}` : ', no inflation'}), completion_tokens=${openaiResponse.usage.completion_tokens}`);
   }
 
   return Response.json(openaiResponse, { headers: responseHeaders });

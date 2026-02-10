@@ -13,15 +13,14 @@ export const ANTHROPIC_API_URL = "https://api.anthropic.com";
 // Required beta headers for Claude Code OAuth
 export const ANTHROPIC_BETA_OAUTH = "oauth-2025-04-20";
 export const ANTHROPIC_BETA_CLAUDE_CODE = "claude-code-20250219";
+export const ANTHROPIC_BETA_COMPACTION = "compact-2026-01-12";
 
 // Combined beta header string for Claude Code OAuth requests
 // - interleaved-thinking-2025-05-14: deprecated on Opus 4.6 (auto-enabled), still needed for 4.5
-// - context-1m-2025-08-07: optional, set ENABLE_1M_CONTEXT=true to test
 const BETA_HEADERS_LIST = [
   ANTHROPIC_BETA_CLAUDE_CODE,
   ANTHROPIC_BETA_OAUTH,
   "interleaved-thinking-2025-05-14",
-  ...(process.env.ENABLE_1M_CONTEXT === "true" ? ["context-1m-2025-08-07"] : []),
 ];
 export const CLAUDE_CODE_BETA_HEADERS = BETA_HEADERS_LIST.join(",");
 
@@ -31,17 +30,27 @@ const CLAUDE_CODE_REQUIRED_BETAS = [
   ANTHROPIC_BETA_OAUTH,         // "oauth-2025-04-20"
 ];
 
+// Beta headers that are NOT available on OAuth subscriptions.
+// Cursor may send these, but the API will reject the entire request with 400.
+const BLOCKED_BETAS = new Set([
+  "context-1m-2025-08-07",  // Requires API Usage Tier 4, not available on OAuth
+]);
+
 /**
  * Merge Cursor's beta headers with Claude Code required headers.
- * Cursor's headers are preserved; Claude Code auth headers are added on top.
+ * Cursor's headers are preserved (except blocked ones); Claude Code auth headers are added on top.
  */
 export function mergeBetaHeaders(cursorBetaHeader: string | null): string {
   const headers = new Set<string>();
   // Always add Claude Code required headers
   for (const h of CLAUDE_CODE_REQUIRED_BETAS) headers.add(h);
-  // Add Cursor's headers
+  // Add Cursor's headers (filtering out blocked ones)
   if (cursorBetaHeader) {
     for (const h of cursorBetaHeader.split(",").map(s => s.trim()).filter(Boolean)) {
+      if (BLOCKED_BETAS.has(h)) {
+        console.log(`   [Beta] Stripped "${h}" (not available on OAuth)`);
+        continue;
+      }
       headers.add(h);
     }
   } else {
@@ -81,14 +90,11 @@ export function getConfig(): ProxyConfig {
     openaiApiKey: process.env.OPENAI_API_KEY,
     openaiBaseUrl: process.env.OPENAI_BASE_URL || "https://api.openai.com",
     allowedIPs,
-    contextStrategy: (process.env.CONTEXT_STRATEGY as "summarize" | "trim" | "none") || "summarize",
-    contextSummarizationModel: process.env.CONTEXT_SUMMARIZATION_MODEL || "claude-sonnet-4-5-20250929",
-    // Default 200K (OAuth enforced). Set ENABLE_1M_CONTEXT=true + env vars to test 1M.
-    contextMaxTokens: parseInt(process.env.CONTEXT_MAX_TOKENS ||
-      (process.env.ENABLE_1M_CONTEXT === "true" ? "1000000" : "200000")),
-    contextTargetTokens: parseInt(process.env.CONTEXT_TARGET_TOKENS ||
-      (process.env.ENABLE_1M_CONTEXT === "true" ? "900000" : "180000")),
-    // thinkingBudget* REMOVED — Opus 4.6 uses adaptive thinking (self-regulating)
+    compactionEnabled: process.env.COMPACTION_ENABLED === "true",
+    compactionTriggerTokens: Math.max(50000, parseInt(process.env.COMPACTION_TRIGGER_TOKENS || "150000", 10)),
+    // Token inflation: only needed when Cursor shows 872K denominator (MAX Mode ON).
+    // With MAX Mode OFF (200K denominator), raw tokens are already truthful — disable inflation.
+    tokenInflationEnabled: process.env.TOKEN_INFLATION === "true",
   };
 
   return cachedConfig;

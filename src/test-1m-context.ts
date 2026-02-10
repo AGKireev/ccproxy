@@ -245,7 +245,7 @@ async function main() {
     if (CLAUDE_CODE_BETA_HEADERS.includes("context-1m")) {
       log("🎉", "ALL TESTS PASSED — 1M context window is WORKING for OAuth!");
       log("💡", "You can keep ENABLE_1M_CONTEXT=true in production.");
-      log("💡", "Consider raising CONTEXT_MAX_TOKENS and CONTEXT_TARGET_TOKENS in .env");
+      log("💡", "1M context window confirmed available for this subscription.");
     } else {
       log("✅", "All tests passed with default (200K) headers.");
       log("💡", "Run with ENABLE_1M_CONTEXT=true to test the 1M context beta header.");

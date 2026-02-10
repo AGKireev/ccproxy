@@ -6,12 +6,26 @@
 import { proxyRequest } from "../anthropic-client";
 import type { AnthropicRequest, AnthropicError } from "../types";
 import { logRequestDetails, extractHeaders, extractAPIKey } from "../server";
+import { normalizeModelName, injectCompaction } from "../openai-adapter";
 
 export async function handleAnthropicRequest(req: Request): Promise<Response> {
   try {
     logRequestDetails(req, "Anthropic /v1/messages");
     const body = (await req.json()) as AnthropicRequest;
+
+    // Inject server-side compaction for Opus 4.6
+    const normalized = normalizeModelName(body.model);
+    const compactionResult = injectCompaction(body, normalized.minorVersion);
+
     const headers = extractHeaders(req);
+
+    // Append compaction beta header if needed
+    if (compactionResult.betaHeader) {
+      const existing = headers["anthropic-beta"] || "";
+      headers["anthropic-beta"] = existing
+        ? `${existing},${compactionResult.betaHeader}`
+        : compactionResult.betaHeader;
+    }
 
     // Check if user provided their own API key
     const userAPIKey = extractAPIKey(req);

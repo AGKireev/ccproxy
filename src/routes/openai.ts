@@ -5,6 +5,8 @@
 
 import {
   openaiToAnthropic,
+  normalizeModelName,
+  injectCompaction,
   type OpenAIChatRequest,
 } from "../openai-adapter";
 import { proxyRequest } from "../anthropic-client";
@@ -21,6 +23,7 @@ import {
   shouldPassthroughToOpenAI,
 } from "../server";
 import { logger } from "../logger";
+import { getConfig } from "../config";
 
 export async function handleOpenAIRequest(req: Request): Promise<Response> {
   try {
@@ -118,7 +121,20 @@ export async function handleOpenAIRequest(req: Request): Promise<Response> {
 
     // Convert to Anthropic for Claude models
     const anthropicBody = openaiToAnthropic(openaiBody);
+
+    // Inject server-side compaction for Opus 4.6
+    const normalized = normalizeModelName(openaiBody.model);
+    const compactionResult = injectCompaction(anthropicBody, normalized.minorVersion);
+
     const headers = extractHeaders(req);
+
+    // Append compaction beta header if needed
+    if (compactionResult.betaHeader) {
+      const existing = headers["anthropic-beta"] || "";
+      headers["anthropic-beta"] = existing
+        ? `${existing},${compactionResult.betaHeader}`
+        : compactionResult.betaHeader;
+    }
 
     // Check if user provided their own API key
     const userAPIKey = extractAPIKey(req);
@@ -215,9 +231,15 @@ export async function handleOpenAIRequest(req: Request): Promise<Response> {
 
     // Transparent passthrough — Cursor handles its own context management
     const managedBody = anthropicBody;
+    const config = getConfig();
     const estimate = countTokens(anthropicBody);
     const originalTokenCount = estimate.total;
-    console.log(`📊 [Tokens] ~${Math.round(originalTokenCount / 1000)}K tokens (estimate, passthrough mode)`);
+    const pctOfLimit = ((originalTokenCount / 200000) * 100).toFixed(1);
+    const pctOfTrigger = ((originalTokenCount / config.compactionTriggerTokens) * 100).toFixed(1);
+    console.log(`📊 [Tokens] ~${Math.round(originalTokenCount / 1000)}K estimated | ${pctOfLimit}% of 200K limit | ${pctOfTrigger}% of ${Math.round(config.compactionTriggerTokens / 1000)}K compaction trigger`);
+    if (originalTokenCount > config.compactionTriggerTokens * 0.8) {
+      console.log(`⚠️  [Tokens] Approaching compaction threshold! API will compact if real tokens ≥ ${Math.round(config.compactionTriggerTokens / 1000)}K`);
+    }
 
     const proxyStartTime = Date.now();
     const response = await proxyRequest(

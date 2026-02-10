@@ -6,6 +6,7 @@
 import type { AnthropicRequest, AnthropicMessage, ContentBlock } from "./types";
 import { translateToolCalls, needsTranslation } from "./tool-call-translator";
 import { logger } from "./logger";
+import { getConfig, ANTHROPIC_BETA_COMPACTION } from "./config";
 
 
 export interface OpenAIMessage {
@@ -502,6 +503,73 @@ export function openaiToAnthropic(request: OpenAIChatRequest): AnthropicRequest 
   return result;
 }
 
+// ── Server-side compaction injection ─────────────────────────────────────────
+
+export interface CompactionInjectionResult {
+  injected: boolean;
+  betaHeader: string | null;
+}
+
+/**
+ * Inject server-side compaction edit for Opus 4.6 models.
+ * Merges with any existing context_management edits from Cursor,
+ * enforcing API-required ordering.
+ */
+export function injectCompaction(
+  request: AnthropicRequest,
+  minorVersion: number | undefined
+): CompactionInjectionResult {
+  const config = getConfig();
+  const isOpus46 = (minorVersion ?? 0) >= 6;
+
+  if (!config.compactionEnabled || !isOpus46) {
+    return { injected: false, betaHeader: null };
+  }
+
+  // Ensure context_management.edits exists
+  if (!request.context_management) {
+    request.context_management = { edits: [] };
+  }
+
+  const edits = request.context_management.edits;
+
+  // Skip if Cursor already sends compaction (future-proofing)
+  if (edits.some(e => e.type === "compact_20260112")) {
+    console.log(`   [Compaction] Already present in Cursor's edits, skipping injection`);
+    return { injected: false, betaHeader: ANTHROPIC_BETA_COMPACTION };
+  }
+
+  // Append compaction edit with custom instructions.
+  // The default compaction prompt summarizes the ENTIRE conversation including the
+  // latest user message. In a proxy scenario where Cursor manages messages, the
+  // compaction block is never preserved — so the model must respond in the same
+  // request using only the summary. We MUST ensure the user's latest question
+  // is clearly preserved in the summary, otherwise the model has nothing to respond to.
+  edits.push({
+    type: "compact_20260112",
+    trigger: { type: "input_tokens", value: config.compactionTriggerTokens },
+    instructions: `Write a detailed summary of this conversation that will replace the full history. You MUST include:
+1. The user's LATEST message/question/request — reproduce it verbatim or near-verbatim. This is critical because the model must respond to it after compaction.
+2. Key context: what project/codebase is being discussed, what files were modified, what decisions were made.
+3. Any active task or pending work the user is waiting on.
+4. Important technical details, error messages, or code snippets that are needed to continue.
+Wrap your summary in a <summary></summary> block.`,
+  });
+
+  // Sort edits to API-required order: clear_thinking → clear_tool_uses → compact
+  const ORDER: Record<string, number> = {
+    clear_thinking_20251015: 0,
+    clear_tool_uses_20250919: 1,
+    compact_20260112: 2,
+  };
+  edits.sort((a, b) => (ORDER[a.type] ?? 99) - (ORDER[b.type] ?? 99));
+
+  console.log(`   [Compaction] Injected compact_20260112 (trigger: ${config.compactionTriggerTokens} tokens)`);
+  console.log(`   [Compaction] Final edits order: [${edits.map(e => e.type).join(", ")}]`);
+
+  return { injected: true, betaHeader: ANTHROPIC_BETA_COMPACTION };
+}
+
 
 export function anthropicToOpenai(
   anthropicResponse: any,
@@ -510,10 +578,15 @@ export function anthropicToOpenai(
   let content = anthropicResponse.content
     ?.map((block: any) => {
       if (block.type === "text") return block.text;
+      // Skip compaction blocks — the summary is the API's internal concern.
+      // Forwarding it to Cursor would cause it to accumulate as regular text,
+      // inflating the conversation payload on every subsequent request.
+      if (block.type === "compaction") return null;
       if (block.type === "tool_use")
         return `[Tool: ${block.name}]`;
       return "";
     })
+    .filter((s: string | null) => s !== null)
     .join("") || "";
 
   // Translate tool calls if present in non-streaming response
