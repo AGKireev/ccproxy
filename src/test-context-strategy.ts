@@ -4,7 +4,7 @@
  * Tests to determine the correct v3 context management strategy.
  * All tests use OAuth authentication (same as production).
  *
- * Run: bun D:\Business\ccproxy\src\test-context-strategy.ts
+ * Run: bun src/test-context-strategy.ts
  */
 
 import { getValidToken } from "./oauth";

@@ -4,9 +4,9 @@
 
 CCProxy has gone through three conceptual phases:
 
-- **v1** (`D:\Business\ccproxy`): Port 8082. Custom proxy-side summarization via `manageContext()`. Included analytics, budget system, context strategy modules. Complex and fragile.
+- **v1**: Port 8082. Custom proxy-side summarization via `manageContext()`. Included analytics, budget system, context strategy modules. Complex and fragile.
 
-- **v2 baseline** (this repo `D:\Business\ccproxy`): Port 8083. Rewritten as a "transparent proxy" — Cursor handles its own context management, proxy just translates formats and routes through OAuth. Simpler, but hit the 200K limit problem.
+- **v2 baseline**: Port 8083. Rewritten as a "transparent proxy" — Cursor handles its own context management, proxy just translates formats and routes through OAuth. Simpler, but hit the 200K limit problem.
 
 - **v2 + compaction** (current): Port 8082. Same transparent proxy philosophy, but with server-side compaction injected for Opus 4.6. The API handles summarization, not the proxy. Best of both worlds.
 

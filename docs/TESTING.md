@@ -14,7 +14,7 @@ Before implementing compaction, we ran 5 tests to determine the optimal approach
 ### Run Command
 
 ```bash
-bun D:\Business\ccproxy\src\test-context-strategy.ts
+bun src/test-context-strategy.ts
 ```
 
 ---
@@ -203,7 +203,7 @@ A test request was sent and returned successfully:
 
 ```json
 {
-  "id": "chatcmpl-msg_01WAWbDbmX9eFF7bgT96Wa93",
+  "id": "chatcmpl-msg_XXXXXXXXXXXXXXXXXXXX",
   "object": "chat.completion",
   "created": 1770569155,
   "model": "claude-4.6-opus",
