@@ -1,71 +1,68 @@
 # CCProxy — Mac Quick-Start Guide
 
-## One-Time Setup
+## One-Time Setup (common)
 
 1. **Install Bun** — `curl -fsSL https://bun.sh/install | bash`, then restart your terminal.
-2. **Install & authenticate Claude Code CLI** — `npm install -g @anthropic-ai/claude-code`, then run `claude /login` and complete the OAuth flow.
-3. **Clone & install the proxy** — `git clone <repo-url> && cd ccproxy && bun install`.
-4. **Create `.env`** — `cp .env.example .env` (defaults work out of the box).
+2. **Install Cloudflared** — `brew install cloudflared`.
+3. **Install & authenticate Claude Code CLI** — `npm install -g @anthropic-ai/claude-code`, then run `claude /login` and complete the OAuth flow.
+4. **Clone & install the proxy** — `git clone <repo-url> && cd ccproxy && bun install`.
+5. **Create `.env`** — `cp .env.example .env` (defaults work out of the box).
 
-Now pick **Option A** or **Option B** below.
+Now pick **Option A** (easiest) or **Option B** (permanent URL).
 
 ---
 
-## Option A — With Cloudflare Tunnel (recommended)
+## Option A — Quick Tunnel (no domain needed)
 
-Cursor routes API calls through its own backend servers, so it can't reach `localhost`. A Cloudflare tunnel gives your proxy a public HTTPS URL that Cursor's servers can reach.
+Cloudflare gives you a temporary public HTTPS URL every time you start the proxy. No account, no domain, no config — just run and go. The URL changes on every restart.
 
 ### One-time setup
 
-5. **Install Cloudflared** — `brew install cloudflared`.
-6. **Set up a tunnel** (pick one):
-   - **Quick tunnel** (URL changes every restart, zero config) — nothing to configure, the start script handles it.
-   - **Named tunnel** (permanent URL, recommended):
-     1. `cloudflared tunnel login`
-     2. `cloudflared tunnel create ccproxy`
-     3. `cloudflared tunnel route dns ccproxy ccproxy.yourdomain.com`
-     4. `cp cloudflared-config.example.yml cloudflared-config.yml` and fill in your tunnel UUID, credentials path, and hostname.
-7. **Configure Cursor**:
+6. **Configure Cursor**:
    1. Open **Cursor → Settings → Models**.
    2. Enable **"Override OpenAI Base URL"**.
-   3. Set the URL to `https://<your-tunnel-url>/v1`.
+   3. Set the URL to `https://xxxxxxxx.trycloudflare.com/v1` (placeholder — you'll get the real URL in step 2 below).
    4. Enter any string as the API key (e.g. `x`) — the proxy uses Claude Code OAuth, not this key.
    5. **Restart Cursor**.
 
 ### Daily usage
 
 1. Open Terminal in the `ccproxy` folder.
-2. Run `./start-proxy.sh` — starts both the proxy and the tunnel.
-3. Wait for the `✅ Both processes running` message.
-4. Open Cursor, pick a Claude model, and use it normally.
-5. When done — press `Ctrl+C` to shut everything down.
+2. Run `./start-proxy.sh` — starts the proxy + a quick tunnel.
+3. Look for the `[tunnel]` line with your temporary URL (e.g. `https://xxxxxxxx.trycloudflare.com`).
+4. Copy that URL, go to **Cursor → Settings → Models**, update the Base URL to `https://<new-url>/v1`, and **restart Cursor**.
+5. Use Cursor normally — pick a Claude model and go.
+6. When done — press `Ctrl+C` to shut everything down.
 
-> **Note**: If you're using a Quick Tunnel, the URL changes on every restart. Update the Base URL in Cursor settings and restart Cursor each time.
+> **Heads up**: The URL changes every time you restart the tunnel. You'll need to update Cursor settings and restart Cursor each time.
 
 ---
 
-## Option B — Without Cloudflare (direct localhost)
+## Option B — Named Tunnel (permanent URL with your own domain)
 
-If you don't want to use Cloudflare, you can run the proxy on `localhost` and point Cursor to it directly. This works when Cursor sends requests straight from your machine (e.g. some API-key setups or other clients that connect locally).
+Set up once with your own domain — the URL never changes. No need to touch Cursor settings again after initial setup.
 
 ### One-time setup
 
-5. **Configure Cursor**:
+6. **Create a Cloudflare tunnel**:
+   1. `cloudflared tunnel login` — opens browser to authenticate with your Cloudflare account.
+   2. `cloudflared tunnel create ccproxy` — creates a named tunnel.
+   3. `cloudflared tunnel route dns ccproxy ccproxy.yourdomain.com` — points your subdomain to the tunnel.
+   4. `cp cloudflared-config.example.yml cloudflared-config.yml` — then edit the file and fill in your tunnel UUID, credentials path, and hostname.
+7. **Configure Cursor**:
    1. Open **Cursor → Settings → Models**.
    2. Enable **"Override OpenAI Base URL"**.
-   3. Set the URL to `http://localhost:8082/v1`.
-   4. Enter any string as the API key (e.g. `x`).
+   3. Set the URL to `https://ccproxy.yourdomain.com/v1`.
+   4. Enter any string as the API key (e.g. `x`) — the proxy uses Claude Code OAuth, not this key.
    5. **Restart Cursor**.
 
 ### Daily usage
 
 1. Open Terminal in the `ccproxy` folder.
-2. Run `bun run index.ts`.
-3. Wait for the `🚀 Server running at http://localhost:8082` message.
+2. Run `./start-proxy.sh` — starts the proxy + your named tunnel.
+3. Wait for the `✅ Both processes running` message.
 4. Open Cursor, pick a Claude model, and use it normally.
-5. When done — press `Ctrl+C` to stop the proxy.
-
-> **⚠️ Limitation**: Cursor typically routes "Override Base URL" requests through its own backend servers, which cannot reach `localhost`. If you experience connection errors, you'll need to switch to **Option A** with Cloudflare.
+5. When done — press `Ctrl+C` to shut everything down.
 
 ---
 
@@ -74,5 +71,4 @@ If you don't want to use Cloudflare, you can run the proxy on `localhost` and po
 - **"command not found: bun"** — restart your terminal after installing Bun.
 - **401 errors** — re-run `claude /login` to refresh your OAuth token.
 - **Quick tunnel URL changed** — update the Base URL in Cursor settings and restart Cursor.
-- **Connection errors with Option B** — Cursor's backend can't reach localhost; switch to Option A.
 - **Logs** — set `VERBOSE_LOGGING=true` in `.env`, then check `api.log`.
