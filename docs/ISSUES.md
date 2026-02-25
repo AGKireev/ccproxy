@@ -233,6 +233,46 @@ When the conversation actually hits 200K tokens, the Anthropic API returns HTTP 
 
 ---
 
+### Issue #16: "Prompt is too long" When Context Exceeds 200K OAuth Cap
+
+**Status**: ✅ FIXED
+**Severity**: High — session breaks, request returns 400, Cursor shows error
+**Discovered**: Production, February 2026
+**Files changed**: `src/context-trimmer.ts` (new), `src/anthropic-client.ts`
+
+**Symptom**: Cursor sends a request with ~204K tokens. The Anthropic API rejects it with HTTP 400:
+```json
+{"error": {"type": "invalid_request_error", "message": "prompt is too long: 204826 tokens > 200000 maximum"}}
+```
+The proxy treated this as a fatal error and returned a 401 authentication failure to Cursor (because no fallback API key was configured). The session broke.
+
+**Root cause**: Cursor's context management (MAX Mode OFF, 200K denominator) handles summarization correctly ~99% of the time. But in rare edge cases, the conversation grows past 200K between turns (e.g., a large tool result pushes it from ~197K to ~204K). The API validates input size against the 200K OAuth cap **before** any context management edits execute, so the request is rejected outright.
+
+**Production log evidence**:
+```
+Previous request: prompt_tokens=197432, anthropic input_tokens=1 (compaction worked)
+This request:     ~223K estimated | 204826 actual tokens > 200000 maximum
+Error: "prompt is too long: 204826 tokens > 200000 maximum"
+```
+
+**Fix applied**: Auto-retry with progressive local trimming. When the proxy detects the "prompt is too long" error:
+
+1. **Parse** the actual token count and limit from the error message
+2. **Trim** the request body locally (no API calls, no summarization — pure truncation)
+3. **Retry** up to 3 times with progressively more aggressive trimming:
+   - Attempt 1 (gentle): Truncate oversized content blocks only (tool_results > 2000 chars, tool_use inputs > 4000 chars, text blocks > 8000 chars)
+   - Attempt 2 (moderate): Drop oldest middle messages, keeping first 3 + last 10 messages protected
+   - Attempt 3 (aggressive): Smaller protection zones (first 2, last 6), truncate tool descriptions, remove images
+4. After each trim, **cleanup structural integrity**: remove orphaned tool_use/tool_result pairs, fix role alternation, ensure first message is user
+
+**Key design decisions**:
+- Trimming logic ported from the old v1 `context-manager.ts` (deleted in the compaction commit) — battle-tested code
+- No summarization API calls — speed matters here, and the retry loop compensates for estimation errors
+- Minimum damage — each attempt trims just enough to hopefully fit, avoiding unnecessary context loss
+- The trimmed body is used only for this one request — Cursor still holds its full history
+
+---
+
 ## Open Issues / Needs More Testing
 
 ### Issue #12: Custom Compaction Instructions Effectiveness

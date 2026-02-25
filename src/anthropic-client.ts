@@ -9,10 +9,12 @@ import {
 import { getValidToken, clearCachedToken } from "./oauth";
 import type { AnthropicRequest, AnthropicError, ContentBlock } from "./types";
 import { logger } from "./logger";
+import { trimForRetry, parsePromptTooLongError } from "./context-trimmer";
 
 type RequestResult =
   | { success: true; response: Response; source: "claude_code" | "api_key" }
-  | { success: false; error: string; shouldFallback: boolean };
+  | { success: false; error: string; shouldFallback: boolean; promptTooLong?: false }
+  | { success: false; error: string; shouldFallback: false; promptTooLong: true; actualTokens: number; maxAllowedTokens: number };
 
 let rateLimitCache: { resetAt: number } | null = null;
 
@@ -251,6 +253,20 @@ async function makeClaudeCodeRequestWithOAuth(
         };
       }
 
+      // Detect "prompt is too long" — this is retryable with trimming
+      const promptTooLong = parsePromptTooLongError(errorMessage);
+      if (promptTooLong) {
+        console.log(`⚠️  [PromptTooLong] ${promptTooLong.actualTokens} tokens > ${promptTooLong.maxTokens} maximum — will attempt trimming`);
+        return {
+          success: false,
+          error: errorMessage,
+          shouldFallback: false,
+          promptTooLong: true,
+          actualTokens: promptTooLong.actualTokens,
+          maxAllowedTokens: promptTooLong.maxTokens,
+        };
+      }
+
       console.log("Claude Code 400 error:", JSON.stringify(errorBody));
       return {
         success: false,
@@ -312,9 +328,53 @@ export async function proxyRequest(
 ): Promise<Response> {
   const config = getConfig();
 
+  const MAX_TRIM_RETRIES = 3;
+
   // Always try Claude Code first (if enabled), then fall back to API key
   if (config.claudeCodeFirst) {
-    const claudeResult = await makeClaudeCodeRequest(endpoint, body, headers);
+    let claudeResult = await makeClaudeCodeRequest(endpoint, body, headers);
+
+    // --- Auto-retry with trimming on "prompt is too long" ---
+    // When the API rejects the request because it exceeds the 200K OAuth cap,
+    // trim the request body minimally and retry up to 3 times.
+    if (!claudeResult.success && claudeResult.promptTooLong) {
+      let trimBody = body;
+      let lastActualTokens = claudeResult.actualTokens;
+      let lastMaxTokens = claudeResult.maxAllowedTokens;
+
+      for (let attempt = 0; attempt < MAX_TRIM_RETRIES; attempt++) {
+        console.log(`\n🔄 [Retry ${attempt + 1}/${MAX_TRIM_RETRIES}] Trimming context: ${lastActualTokens} tokens > ${lastMaxTokens} limit (excess: ${lastActualTokens - lastMaxTokens})`);
+
+        const trimResult = trimForRetry(trimBody, lastActualTokens, lastMaxTokens, attempt);
+        trimBody = trimResult.request;
+
+        console.log(`   [Retry ${attempt + 1}/${MAX_TRIM_RETRIES}] Trimmed: ${trimResult.messagesBefore} -> ${trimResult.messagesAfter} messages, ~${Math.round(trimResult.estimatedTokens / 1000)}K estimated`);
+
+        // Retry with the trimmed body
+        claudeResult = await makeClaudeCodeRequest(endpoint, trimBody, headers);
+
+        if (claudeResult.success) {
+          console.log(`✓ Request served via Claude Code (after ${attempt + 1} trim retry/retries)`);
+          return claudeResult.response;
+        }
+
+        if (!claudeResult.promptTooLong) {
+          // Different error — break out and let normal error handling take over
+          break;
+        }
+
+        // Still too long — update token counts for next attempt
+        lastActualTokens = claudeResult.actualTokens;
+        lastMaxTokens = claudeResult.maxAllowedTokens;
+        console.log(`   [Retry ${attempt + 1}/${MAX_TRIM_RETRIES}] Still too long: ${lastActualTokens} tokens > ${lastMaxTokens} limit`);
+      }
+
+      // All retries exhausted or different error
+      if (!claudeResult.success && claudeResult.promptTooLong) {
+        console.log(`❌ [Trim] All ${MAX_TRIM_RETRIES} trim retries exhausted, request still too long`);
+      }
+    }
+    // --- End auto-retry ---
 
     if (claudeResult.success) {
       console.log(`✓ Request served via Claude Code`);
