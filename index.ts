@@ -40,6 +40,13 @@ if (config.tokenInflationEnabled) {
   console.log(`✓ Token inflation disabled (for MAX Mode OFF / 200K denominator — raw tokens are truthful)`);
 }
 
+if (config.proxySecretKey) {
+  const keyPreview = config.proxySecretKey.substring(0, 8) + "..." + config.proxySecretKey.substring(config.proxySecretKey.length - 4);
+  console.log(`🔒 Proxy secret key enabled (${keyPreview}) — all /v1/* requests require Bearer token`);
+} else {
+  console.log(`⚠️  No PROXY_SECRET_KEY set — proxy is open to anyone who knows the URL!`);
+}
+
 if (process.env.VERBOSE_LOGGING === "true") {
   console.log(`\n📝 Verbose file logging enabled → api.log (gitignored)\n`);
 } else {

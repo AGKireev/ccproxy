@@ -121,4 +121,5 @@ export interface ProxyConfig {
   compactionEnabled: boolean;
   compactionTriggerTokens: number;
   tokenInflationEnabled: boolean;
+  proxySecretKey?: string;
 }

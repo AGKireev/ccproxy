@@ -95,6 +95,9 @@ export function getConfig(): ProxyConfig {
     // Token inflation: only needed when Cursor shows 872K denominator (MAX Mode ON).
     // With MAX Mode OFF (200K denominator), raw tokens are already truthful — disable inflation.
     tokenInflationEnabled: process.env.TOKEN_INFLATION === "true",
+    // Proxy secret key: when set, all /v1/* requests must include this as Bearer token.
+    // Cursor sends the "API Key" field as Authorization: Bearer <key>.
+    proxySecretKey: process.env.PROXY_SECRET_KEY || undefined,
   };
 
   return cachedConfig;

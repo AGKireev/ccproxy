@@ -86,6 +86,56 @@ export function extractAPIKey(req: Request): string | null {
   return null;
 }
 
+/**
+ * Extract the Bearer token from the request (any value, not just sk-ant-*).
+ * Cursor sends the "API Key" field as `Authorization: Bearer <key>`.
+ */
+function extractBearerToken(req: Request): string | null {
+  const authHeader = req.headers.get("authorization");
+  if (authHeader?.startsWith("Bearer ")) {
+    return authHeader.substring(7).trim() || null;
+  }
+  // Also check x-api-key header as fallback
+  return req.headers.get("x-api-key") || null;
+}
+
+/**
+ * Validate the proxy secret key.
+ * When PROXY_SECRET_KEY is set, all /v1/* requests must include it as a Bearer token.
+ * Uses constant-time comparison to prevent timing attacks.
+ */
+function checkProxySecretKey(req: Request): { allowed: boolean; reason?: string } {
+  if (!config.proxySecretKey) {
+    // No secret key configured — allow all requests (rely on IP whitelist only)
+    return { allowed: true };
+  }
+
+  const token = extractBearerToken(req);
+  if (!token) {
+    return { allowed: false, reason: "Missing API key" };
+  }
+
+  // Constant-time comparison to prevent timing attacks
+  const expected = config.proxySecretKey;
+  if (token.length !== expected.length) {
+    return { allowed: false, reason: "Invalid API key" };
+  }
+
+  // Bun supports crypto.timingSafeEqual
+  const a = new TextEncoder().encode(token);
+  const b = new TextEncoder().encode(expected);
+  let mismatch = 0;
+  for (let i = 0; i < a.length; i++) {
+    mismatch |= a[i]! ^ b[i]!;
+  }
+
+  if (mismatch !== 0) {
+    return { allowed: false, reason: "Invalid API key" };
+  }
+
+  return { allowed: true };
+}
+
 function checkIPWhitelist(req: Request): {
   allowed: boolean;
   ip?: string;
@@ -146,8 +196,24 @@ export function startServer() {
         });
       }
 
-      // IP whitelist for API endpoints
+      // Security checks for API endpoints
       if (url.pathname.startsWith("/v1/")) {
+        // Layer 1: Proxy secret key (when configured)
+        const secretCheck = checkProxySecretKey(req);
+        if (!secretCheck.allowed) {
+          console.log(`\n🚫 [SECURITY] Blocked request: ${secretCheck.reason}`);
+          return Response.json(
+            {
+              error: {
+                type: "authentication_error",
+                message: "Unauthorized",
+              },
+            },
+            { status: 401 }
+          );
+        }
+
+        // Layer 2: IP whitelist (when request comes through Cloudflare tunnel)
         const ipCheck = checkIPWhitelist(req);
         if (!ipCheck.allowed) {
           return Response.json(
