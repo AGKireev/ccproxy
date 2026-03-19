@@ -37,4 +37,5 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 
 # Local config files with credentials
 cloudflared-config.yml
+cloudflared-config-server.yml
 start-proxy*
