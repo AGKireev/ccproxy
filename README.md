@@ -28,7 +28,7 @@ cloudflared tunnel --url http://localhost:8082
 cloudflared tunnel --config ./cloudflared-config.yml run
 ```
 
-> **Security**: Treat your tunnel URL like an API key. IP whitelisting is enforced for tunnel requests.
+> **Security**: Set `PROXY_SECRET_KEY` in `.env` to protect your proxy — see [Security](#security) below.
 
 ## How It Works
 
@@ -63,17 +63,54 @@ See [docs/COMPACTION.md](docs/COMPACTION.md) for the full deep-dive.
 - File locking prevents races with Claude CLI running in parallel
 - In-process mutex prevents concurrent refresh from parallel requests
 
+## Security
+
+The proxy has two security layers, configured via `.env`:
+
+### Proxy Secret Key (recommended)
+
+Set `PROXY_SECRET_KEY` to a long random string. When set, **every** `/v1/*` request must include it as a Bearer token — requests without it (or with a wrong key) get `401 Unauthorized`.
+
+```bash
+# Generate a key
+bun -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+
+# Add to .env
+PROXY_SECRET_KEY=your_generated_key_here
+```
+
+**In Cursor**: Set the key as the **API Key** field in your Override settings (Cursor sends it as `Authorization: Bearer <key>` automatically).
+
+> **⚠️ If `PROXY_SECRET_KEY` is not set, the proxy is open to anyone who knows the URL!**
+
+### IP Whitelist (optional, can be disabled)
+
+`ALLOWED_IPS` restricts which IPs can access `/v1/*` endpoints through the Cloudflare tunnel. This check only applies when Cloudflare headers (`CF-Connecting-IP`) are present — local requests are always allowed.
+
+```bash
+# Restrict to specific IPs (comma-separated)
+ALLOWED_IPS=52.44.113.131,184.73.225.134
+
+# Disable IP whitelist (comment out or set to "*")
+# ALLOWED_IPS=*
+```
+
+**Why you might want to disable it**: Cursor routes requests through their own backend servers (AWS). These server IPs change over time. If a new Cursor server IP is not in your whitelist, you'll see `"Unauthorized: IP x.x.x.x not in whitelist"` errors in Cursor. With `PROXY_SECRET_KEY` active, the IP whitelist is redundant and can be safely disabled.
+
+**If you see `IP not in whitelist` errors**: Either add the blocked IP to `ALLOWED_IPS`, or disable the whitelist entirely by commenting out `ALLOWED_IPS` (and make sure `PROXY_SECRET_KEY` is set).
+
 ## Configuration
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PORT` | `8082` | Proxy port |
+| `PROXY_SECRET_KEY` | - | **Recommended.** Secret key for proxy access. Set in Cursor as API Key. |
+| `ALLOWED_IPS` | disabled | Comma-separated IP whitelist. Set to `*` or leave unset to disable. |
 | `ANTHROPIC_API_KEY` | - | Fallback API key when Claude Code limits hit |
 | `COMPACTION_ENABLED` | `true` | Server-side compaction for Opus 4.6+ |
 | `COMPACTION_TRIGGER_TOKENS` | `150000` | Token threshold for compaction (min: 50000) |
 | `OPENAI_API_KEY` | - | For non-Claude model passthrough |
 | `OPENAI_BASE_URL` | `https://api.openai.com` | OpenAI/OpenRouter base URL |
-| `ALLOWED_IPS` | Cursor backend IPs | IP whitelist for tunnel requests |
 | `VERBOSE_LOGGING` | `false` | Detailed file logging to `api.log` |
 
 See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for the complete reference.
@@ -113,6 +150,8 @@ See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for the complete reference.
 
 | Issue | Fix |
 |-------|-----|
+| `Unauthorized` (401) | `PROXY_SECRET_KEY` is set but Cursor isn't sending the key. Set the key as **API Key** in Cursor's Override settings. |
+| `IP x.x.x.x not in whitelist` (403) | A new Cursor backend IP isn't in `ALLOWED_IPS`. Either add it, or disable the whitelist by commenting out `ALLOWED_IPS` (recommended if `PROXY_SECRET_KEY` is set). |
 | No credentials found | Run `claude /login` |
 | Token invalid / expired | Run `claude /login` again |
 | `invalid_grant` on refresh | Another process rotated the token. Run `claude /login`. |

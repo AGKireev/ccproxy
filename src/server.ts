@@ -141,6 +141,11 @@ function checkIPWhitelist(req: Request): {
   ip?: string;
   reason?: string;
 } {
+  // If no IPs configured (ALLOWED_IPS not set or "*"), skip IP check entirely
+  if (config.allowedIPs.length === 0) {
+    return { allowed: true, ip: "disabled" };
+  }
+
   const cfRay = req.headers.get("cf-ray");
   const cfConnectingIp = req.headers.get("cf-connecting-ip");
 

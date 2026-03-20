@@ -40,6 +40,12 @@ if (config.tokenInflationEnabled) {
   console.log(`✓ Token inflation disabled (for MAX Mode OFF / 200K denominator — raw tokens are truthful)`);
 }
 
+if (config.allowedIPs.length > 0) {
+  console.log(`🛡️  IP whitelist enabled (${config.allowedIPs.length} IPs)`);
+} else {
+  console.log(`✓ IP whitelist disabled (ALLOWED_IPS not set or "*")`);
+}
+
 if (config.proxySecretKey) {
   const keyPreview = config.proxySecretKey.substring(0, 8) + "..." + config.proxySecretKey.substring(config.proxySecretKey.length - 4);
   console.log(`🔒 Proxy secret key enabled (${keyPreview}) — all /v1/* requests require Bearer token`);

@@ -76,12 +76,11 @@ export function getConfig(): ProxyConfig {
   if (cachedConfig) return cachedConfig;
 
   // Parse allowed IPs from environment (comma-separated)
-  const allowedIPsEnv =
-    process.env.ALLOWED_IPS || "52.44.113.131,184.73.225.134";
-  const allowedIPs = allowedIPsEnv
-    .split(",")
-    .map((ip) => ip.trim())
-    .filter(Boolean);
+  // If not set or set to "*", IP whitelist is disabled (allow all)
+  const allowedIPsEnv = process.env.ALLOWED_IPS;
+  const allowedIPs = (!allowedIPsEnv || allowedIPsEnv.trim() === "*")
+    ? []
+    : allowedIPsEnv.split(",").map((ip) => ip.trim()).filter(Boolean);
 
   cachedConfig = {
     port: parseInt(process.env.PORT || "8082", 10),

@@ -34,9 +34,54 @@ When enabled, the proxy injects a `compact_20260112` edit that triggers Anthropi
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ALLOWED_IPS` | `52.44.113.131,184.73.225.134` | Comma-separated IP whitelist for tunnel requests. Only enforced when CF-* headers are present (Cloudflare tunnel). |
+| `PROXY_SECRET_KEY` | - | **Recommended.** When set, all `/v1/*` requests must include this value as a Bearer token. Cursor sends its "API Key" field as `Authorization: Bearer <key>`, so just paste the key into Cursor's Override settings. If not set, the proxy is open to anyone who knows the URL. |
+| `ALLOWED_IPS` | disabled | Comma-separated IP whitelist for tunnel requests. Only enforced when Cloudflare headers (`CF-Connecting-IP`) are present — local requests always pass. If not set or set to `*`, the whitelist is disabled entirely. |
 
-Default IPs are Cursor's backend servers. Add new IPs as Cursor's infrastructure changes.
+#### Proxy Secret Key
+
+This is the primary security layer. Generate a key and add it to `.env`:
+
+```bash
+# Generate a 64-character hex key
+bun -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+```
+
+```env
+PROXY_SECRET_KEY=your_generated_key_here
+```
+
+**Cursor setup**: Go to Settings → Models → Override OpenAI Base URL, and paste the key into the **API Key** field. Cursor sends this as `Authorization: Bearer <key>` with every request.
+
+Without a valid key, the proxy returns `401 Unauthorized` (generic error — reveals nothing about the proxy).
+
+#### IP Whitelist
+
+An optional second security layer. When `ALLOWED_IPS` is set, only requests from those IPs are allowed through the Cloudflare tunnel.
+
+```env
+# Enable with specific IPs
+ALLOWED_IPS=52.44.113.131,184.73.225.134
+
+# Disable (any of these):
+# ALLOWED_IPS=*
+# or simply comment it out / don't set it
+```
+
+**Why you might disable it**: Cursor doesn't call your proxy directly — it routes requests through its own AWS backend servers. These server IPs change over time as Cursor scales. When a new server IP appears, it won't be in your whitelist, and you'll see:
+
+```
+Provider returned error: {"error":{"type":"authentication_error","message":"Unauthorized: IP 52.59.29.232 not in whitelist"}}
+```
+
+**Fix**: Either add the new IP to `ALLOWED_IPS`, or disable the whitelist by commenting it out. With `PROXY_SECRET_KEY` active, the IP whitelist is redundant — the secret key already prevents unauthorized access.
+
+**Security layers summary**:
+
+| Layer | Protects against | Recommended |
+|-------|-----------------|-------------|
+| `PROXY_SECRET_KEY` | Anyone without the key | ✅ Yes — always set this |
+| `ALLOWED_IPS` | Requests from non-Cursor IPs | Optional — can disable if secret key is set |
+| Cloudflare tunnel | Direct access to server ports | ✅ Yes — no open ports |
 
 ### Logging
 
