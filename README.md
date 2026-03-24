@@ -138,13 +138,13 @@ See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for the complete reference.
 
 ## Known Limitations
 
-- **OAuth 200K hard cap**: If a single request has > 200K input tokens before the API can compact, it will still fail. Compaction only helps conversations that *grow* past the limit over multiple turns.
+- **Context window limits**: Opus/Sonnet 4.6 support up to 1M tokens (GA since March 2026). Older models (4.5) are capped at 200K. If a request exceeds the limit, the proxy auto-retries with progressive trimming.
 - **Re-compaction on every qualifying request**: OpenAI format can't represent `compaction` blocks — they are stripped from responses. Cursor never preserves them. Every request over 150K tokens triggers fresh compaction (~3500 tokens overhead). This is wasteful but prevents session death.
 - **Compaction summary quality**: After compaction, response quality depends on the summary preserving the user's question. Custom instructions are injected to mitigate this, but very complex multi-part questions may still be imperfectly summarized.
 - **Opus 4.6 only**: Compaction is only supported on `claude-opus-4-6`. Older models (4.5) don't have the compaction API and aren't affected by the 200K mismatch (their native window matches the OAuth cap).
 - **Cloudflare tunnel idle timeout**: Proxy sends SSE keepalives every 25s to mitigate, but very long thinking periods may still drop.
 - **Tool call edge cases**: XML tool call translation handles common patterns but complex schemas may not translate perfectly.
-- **1M context not available**: Cursor sends `context-1m-2025-08-07` beta header but this requires API Usage Tier 4 (not available on OAuth). The proxy strips this header automatically.
+- **1M context available**: Opus/Sonnet 4.6 support 1M context natively (GA March 2026). No beta header needed. Use Cursor's MAX mode toggle to control how much context is sent.
 
 ## Troubleshooting
 
@@ -155,8 +155,7 @@ See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for the complete reference.
 | No credentials found | Run `claude /login` |
 | Token invalid / expired | Run `claude /login` again |
 | `invalid_grant` on refresh | Another process rotated the token. Run `claude /login`. |
-| `prompt is too long` (400) | Compaction should prevent this. Check that `COMPACTION_ENABLED` is not `false`. |
-| `long context beta not available` (400) | Beta header filtering should prevent this. Check `BLOCKED_BETAS` in config.ts. |
+| `prompt is too long` (400) | The proxy auto-retries with progressive trimming (up to 3 attempts). If it persists, the conversation is too large even for 1M context. |
 | Empty response after compaction | Custom compaction instructions should preserve the user's question. Check proxy logs for compaction delta content. |
 | Tunnel drops during responses | Cloudflare idle timeout. Check tunnel config keepalive settings. |
 | Cursor not using the proxy | Restart Cursor after changing the base URL; toggle the setting off and on. |

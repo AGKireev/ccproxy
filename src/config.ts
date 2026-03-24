@@ -32,8 +32,9 @@ const CLAUDE_CODE_REQUIRED_BETAS = [
 
 // Beta headers that are NOT available on OAuth subscriptions.
 // Cursor may send these, but the API will reject the entire request with 400.
-const BLOCKED_BETAS = new Set([
-  "context-1m-2025-08-07",  // Requires API Usage Tier 4, not available on OAuth
+// Note: context-1m-2025-08-07 was removed — 1M context is now GA for Opus/Sonnet 4.6 (March 2026).
+const BLOCKED_BETAS = new Set<string>([
+  // Currently empty — all Cursor beta headers are safe to pass through
 ]);
 
 /**

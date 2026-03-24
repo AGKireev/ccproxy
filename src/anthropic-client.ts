@@ -335,7 +335,7 @@ export async function proxyRequest(
     let claudeResult = await makeClaudeCodeRequest(endpoint, body, headers);
 
     // --- Auto-retry with trimming on "prompt is too long" ---
-    // When the API rejects the request because it exceeds the 200K OAuth cap,
+    // When the API rejects the request because it exceeds the context limit (200K or 1M),
     // trim the request body minimally and retry up to 3 times.
     if (!claudeResult.success && claudeResult.promptTooLong) {
       let trimBody = body;

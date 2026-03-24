@@ -19,7 +19,7 @@ All configuration is via environment variables. Bun loads `.env` automatically (
 | `COMPACTION_ENABLED` | `true` | Enable server-side compaction for Opus 4.6+ models. Set `false` to disable. |
 | `COMPACTION_TRIGGER_TOKENS` | `150000` | Token threshold to trigger compaction. Minimum: 50000 (API enforced). |
 
-When enabled, the proxy injects a `compact_20260112` edit that triggers Anthropic's server-side summarization when input tokens exceed the trigger threshold. This prevents 400 errors when the OAuth 200K context limit is approached.
+When enabled, the proxy injects a `compact_20260112` edit that triggers Anthropic's server-side summarization when input tokens exceed the trigger threshold. This can help manage very long conversations proactively.
 
 ### OpenAI/OpenRouter Passthrough
 
@@ -95,7 +95,7 @@ Provider returned error: {"error":{"type":"authentication_error","message":"Unau
 |----------|---------|-------------|
 | `CLAUDE_CODE_EXTRA_INSTRUCTION` | `"CRITICAL: You are running headless as a proxy..."` | Extra system prompt appended after the required Claude Code prefix. Set to empty string to disable. |
 
-> **Note**: `ENABLE_1M_CONTEXT` was removed. The `context-1m-2025-08-07` beta requires API Usage Tier 4 which is NOT available on OAuth. Cursor sends this header by default — it is now stripped automatically by `BLOCKED_BETAS`.
+> **Note**: 1M context is now GA for Opus/Sonnet 4.6 (March 2026). No beta header or special config is needed. The `context-1m-2025-08-07` header is no longer blocked.
 
 ---
 
@@ -113,7 +113,7 @@ These are not configurable via environment but are important to know:
 | `ANTHROPIC_BETA_CLAUDE_CODE` | `claude-code-20250219` | Required beta for Claude Code |
 | `ANTHROPIC_BETA_COMPACTION` | `compact-2026-01-12` | Compaction beta header |
 | `CLAUDE_CODE_SYSTEM_PROMPT` | `"You are Claude Code..."` | Required system prompt prefix for OAuth |
-| `BLOCKED_BETAS` | `Set(["context-1m-2025-08-07"])` | Beta headers stripped from Cursor's requests (incompatible with OAuth) |
+| `BLOCKED_BETAS` | `Set([])` (empty) | Beta headers stripped from Cursor's requests. Currently empty — all headers pass through. |
 
 ---
 
@@ -187,12 +187,11 @@ max-effort-2026-01-24                # Max effort variant
 adaptive-thinking-2026-01-28         # Adaptive thinking for Opus 4.6
 ```
 
-### Blocked (Stripped by Proxy)
+### Previously Blocked (No Longer Blocked)
 ```
-context-1m-2025-08-07               # Requires API Usage Tier 4 — NOT available on OAuth
-                                     # Cursor sends this by default. Without filtering,
-                                     # API returns 400: "The long context beta is not yet
-                                     # available for this subscription."
+context-1m-2025-08-07               # Was blocked — required API Usage Tier 4
+                                     # Now: 1M context is GA for 4.6 models (March 2026).
+                                     # Header is harmless and passes through.
 ```
 
 The `mergeBetaHeaders()` function in `config.ts` uses a `Set` to combine all headers, preventing duplicates. The `BLOCKED_BETAS` set filters out headers incompatible with OAuth before merging.

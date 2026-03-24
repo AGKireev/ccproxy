@@ -234,9 +234,11 @@ export async function handleOpenAIRequest(req: Request): Promise<Response> {
     const config = getConfig();
     const estimate = countTokens(anthropicBody);
     const originalTokenCount = estimate.total;
-    const pctOfLimit = ((originalTokenCount / 200000) * 100).toFixed(1);
+    // Context limit depends on model version: 1M for 4.6, 200K for 4.5 and older
+    const contextLimit = (normalized.minorVersion ?? 0) >= 6 ? 1000000 : 200000;
+    const pctOfLimit = ((originalTokenCount / contextLimit) * 100).toFixed(1);
     const pctOfTrigger = ((originalTokenCount / config.compactionTriggerTokens) * 100).toFixed(1);
-    console.log(`📊 [Tokens] ~${Math.round(originalTokenCount / 1000)}K estimated | ${pctOfLimit}% of 200K limit | ${pctOfTrigger}% of ${Math.round(config.compactionTriggerTokens / 1000)}K compaction trigger`);
+    console.log(`📊 [Tokens] ~${Math.round(originalTokenCount / 1000)}K estimated | ${pctOfLimit}% of ${Math.round(contextLimit / 1000)}K limit | ${pctOfTrigger}% of ${Math.round(config.compactionTriggerTokens / 1000)}K compaction trigger`);
     if (originalTokenCount > config.compactionTriggerTokens * 0.8) {
       console.log(`⚠️  [Tokens] Approaching compaction threshold! API will compact if real tokens ≥ ${Math.round(config.compactionTriggerTokens / 1000)}K`);
     }

@@ -5,8 +5,9 @@
  * NO summarization, NO API calls, NO caching — pure local truncation.
  *
  * Design:
- * - Only invoked on retry after the API returns "prompt is too long: N tokens > 200000 maximum"
+ * - Only invoked on retry after the API returns "prompt is too long: N tokens > M maximum"
  * - Each attempt trims progressively more aggressively (attempt 1 = gentle, 3 = aggressive)
+ * - Target tokens are derived as a percentage of the API-reported max (works for 200K and 1M)
  * - Preserves structural integrity: tool_use/tool_result pairs, user/assistant alternation
  * - Uses character-based token estimation (fast, no network calls)
  */
@@ -15,14 +16,15 @@ import type { AnthropicRequest, AnthropicMessage, ContentBlock } from "./types";
 import { countTokens, countMessageTokens } from "./token-counter";
 
 // --- Configuration ---
-// Protection zones shrink with each attempt to shed more tokens
+// Protection zones shrink with each attempt to shed more tokens.
+// targetRatio is multiplied by the API-reported maxTokens to compute the actual target.
 const ATTEMPT_CONFIG = [
   // Attempt 1 (gentle): only truncate oversized content blocks
-  { protectFirst: 3, protectLast: 10, targetTokens: 195000, truncateToolDescs: false, removeImages: false },
+  { protectFirst: 3, protectLast: 10, targetRatio: 0.975, truncateToolDescs: false, removeImages: false },
   // Attempt 2 (moderate): drop oldest middle messages
-  { protectFirst: 3, protectLast: 10, targetTokens: 190000, truncateToolDescs: false, removeImages: false },
+  { protectFirst: 3, protectLast: 10, targetRatio: 0.950, truncateToolDescs: false, removeImages: false },
   // Attempt 3 (aggressive): smaller protection zones, truncate tool descriptions, remove images
-  { protectFirst: 2, protectLast: 6, targetTokens: 180000, truncateToolDescs: true, removeImages: true },
+  { protectFirst: 2, protectLast: 6, targetRatio: 0.900, truncateToolDescs: true, removeImages: true },
 ];
 
 export interface TrimResult {
@@ -51,9 +53,10 @@ export function trimForRetry(
   const messagesBefore = trimmed.messages.length;
   const configIndex = Math.min(attempt, ATTEMPT_CONFIG.length - 1);
   const config = ATTEMPT_CONFIG[configIndex]!;
+  const targetTokens = Math.floor(maxTokens * config.targetRatio);
   const excess = actualTokens - maxTokens;
 
-  console.log(`   [Trim] Attempt ${attempt + 1}/3: excess=${excess} tokens, target=${Math.round(config.targetTokens / 1000)}K, protect first ${config.protectFirst} + last ${config.protectLast}`);
+  console.log(`   [Trim] Attempt ${attempt + 1}/3: excess=${excess} tokens, target=${Math.round(targetTokens / 1000)}K (${Math.round(config.targetRatio * 100)}% of ${Math.round(maxTokens / 1000)}K), protect first ${config.protectFirst} + last ${config.protectLast}`);
 
   // Step 1: Truncate oversized content blocks (all attempts)
   truncateLargeContentBlocks(trimmed);
@@ -65,7 +68,7 @@ export function trimForRetry(
 
   // Step 3: Drop middle messages if still over target (attempts 2+)
   if (attempt >= 1) {
-    dropMiddleMessages(trimmed, config.protectFirst, config.protectLast, config.targetTokens);
+    dropMiddleMessages(trimmed, config.protectFirst, config.protectLast, targetTokens);
   }
 
   // Step 4: Remove images (attempt 3 only, last resort)
@@ -431,7 +434,7 @@ export function cleanupOrphanedToolPairs(messages: AnthropicMessage[]): Anthropi
 
 /**
  * Parse the "prompt is too long" error message to extract token counts.
- * Expected format: "prompt is too long: 204826 tokens > 200000 maximum"
+ * Expected format: "prompt is too long: 204826 tokens > 200000 maximum" (or 1000000 for 1M context)
  * Returns null if the error doesn't match this pattern.
  */
 export function parsePromptTooLongError(errorMessage: string): {
