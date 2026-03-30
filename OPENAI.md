@@ -2,7 +2,9 @@
 
 CCProxy can route OpenAI model requests (GPT-5.4, GPT-4o, o3, etc.) through your **ChatGPT subscription** (Plus $20/mo or Pro $200/mo) instead of paying per-token API fees. This works the same way as the Claude Code proxy — your subscription gives you access to the models, and CCProxy acts as the bridge.
 
-By default, the proxy uses **GPT-5.4 with maximum reasoning (`xhigh`)** — equivalent to "GPT-5.4 Extra High Thinking" in Cursor. This is the most powerful configuration available: deepest chain-of-thought reasoning with the full 1M token context window.
+By default, the proxy uses **GPT-5.4 with maximum reasoning (`high`)** — the highest reasoning effort supported by the Codex Responses API. This provides deep chain-of-thought reasoning with the full 1M token context window.
+
+> **Note**: The `openai-oauth` library and Codex backend support reasoning efforts: `none`, `minimal`, `low`, `medium`, `high`. The `xhigh` level (advertised in Cursor's UI) is not a separate API parameter — it's handled internally by the backend. The proxy uses `high` which is the maximum effort available via the API.
 
 ---
 
@@ -110,19 +112,19 @@ Returns:
 
 | Model ID in Cursor | Reasoning Effort | Context Window | Description |
 |---|---|---|---|
-| `gpt-5.4` | **xhigh** (default) | 1M tokens | **Maximum reasoning — recommended** |
-| `gpt-5.4-extra-high-thinking` | xhigh | 1M tokens | Explicit max reasoning (same as above) |
-| `gpt-5.4-xhigh` | xhigh | 1M tokens | Explicit max reasoning (same as above) |
-| `gpt-5.4-high` | high | 1M tokens | Strong reasoning, faster than xhigh |
+| `gpt-5.4` | **high** (default) | 1M tokens | **Maximum reasoning — recommended** |
+| `gpt-5.4-extra-high-thinking` | high | 1M tokens | Explicit max reasoning (same as above) |
+| `gpt-5.4-xhigh` | high | 1M tokens | Mapped to "high" (max supported by API) |
+| `gpt-5.4-high` | high | 1M tokens | Maximum reasoning |
 | `gpt-5.4-medium` | medium | 1M tokens | Balanced speed/quality |
-| `gpt-5.4-thinking` | xhigh | 1M tokens | Alias for max reasoning |
+| `gpt-5.4-thinking` | high | 1M tokens | Alias for max reasoning |
 | `gpt-5.4-fast` | high | 1M tokens | 15% faster processing |
 | `gpt-4o` | — | 128K tokens | General purpose |
 | `gpt-4o-mini` | — | 128K tokens | Fast and cheap |
 | `o3` | — | 200K tokens | Reasoning model |
 | `o4-mini` | — | 200K tokens | Fast reasoning model |
 
-**Default behavior**: When you select `gpt-5.4` without any suffix, the proxy automatically applies `xhigh` reasoning — the maximum thinking power. This is equivalent to "GPT-5.4 Extra High Thinking" in Cursor.
+**Default behavior**: When you select `gpt-5.4` without any suffix, the proxy automatically applies `high` reasoning — the maximum thinking effort available via the API.
 
 ---
 
@@ -135,10 +137,11 @@ GPT-5.4 supports configurable reasoning depth via the `reasoning.effort` paramet
 | `none` | Fastest | Cheapest | Simple text generation, no chain-of-thought |
 | `low` | Fast | Low | Quick syntax questions, simple transformations |
 | `medium` | Moderate | Moderate | Standard coding tasks, implementations |
-| `high` | Slower | Higher | Debugging, refactoring, architectural decisions |
-| **`xhigh`** | **Slowest** | **3-5× high** | **Complex multi-file analysis, hardest problems** |
+| **`high`** | **Slower** | **Highest** | **Debugging, refactoring, architectural decisions** |
 
-The proxy defaults to `xhigh` because IDE coding tasks benefit from maximum reasoning depth. You can override this per-request by using a model name suffix (e.g., `gpt-5.4-high`) or globally via `OPENAI_CODEX_REASONING_EFFORT` in `.env`.
+The proxy defaults to `high` because IDE coding tasks benefit from maximum reasoning depth. You can override this per-request by using a model name suffix (e.g., `gpt-5.4-medium`) or globally via `OPENAI_CODEX_REASONING_EFFORT` in `.env`.
+
+> **Note on `xhigh`**: Cursor's UI shows "GPT-5.4 Extra High Thinking" but the Codex API's maximum `reasoning.effort` value is `"high"`. The "extra high" behavior in the Cursor product may be handled internally by OpenAI's infrastructure rather than being an API-level parameter. If you set `OPENAI_CODEX_REASONING_EFFORT=xhigh`, the proxy will automatically map it to `"high"` and log a warning.
 
 ---
 
@@ -155,9 +158,9 @@ All options go in your `.env` file:
 # Default model (default: gpt-5.4)
 # OPENAI_CODEX_DEFAULT_MODEL=gpt-5.4
 
-# Default reasoning effort (default: xhigh — maximum thinking)
-# Options: none, low, medium, high, xhigh
-# OPENAI_CODEX_REASONING_EFFORT=xhigh
+# Default reasoning effort (default: high — maximum supported by API)
+# Options: none, minimal, low, medium, high
+# OPENAI_CODEX_REASONING_EFFORT=high
 
 # Fallback: standard OpenAI API key (used when Codex subscription fails)
 # OPENAI_API_KEY=sk-xxx
@@ -196,7 +199,7 @@ Cursor                          CCProxy                         OpenAI
   |                               |  2. Check: ~/.codex/auth.json |
   |                               |  3. Convert Chat Completions  |
   |                               |     → Responses API format    |
-  |                               |  4. Add reasoning:{effort:"xhigh"}
+  |                               |  4. Add reasoning:{effort:"high"}
   |                               |                               |
   |                               |  POST chatgpt.com/backend-api |
   |                               |       /codex/responses        |
@@ -215,7 +218,7 @@ Cursor                          CCProxy                         OpenAI
 
 2. **Format conversion**: Cursor sends Chat Completions format (`messages` array). The Codex backend expects Responses API format (`input` array). The proxy converts transparently.
 
-3. **Reasoning injection**: Adds `reasoning: { effort: "xhigh" }` to every request unless a specific effort level is in the model name.
+3. **Reasoning injection**: Adds `reasoning: { effort: "high" }` to every request unless a specific effort level is in the model name.
 
 4. **SSE transcoding**: The Codex backend streams Responses API events (`response.output_text.delta`, etc.). The proxy transcodes these to Chat Completions SSE events that Cursor understands.
 
@@ -235,10 +238,42 @@ OpenAI restricts Codex access in some regions. Try using a VPN to a supported re
 Your ChatGPT subscription has usage limits. The proxy caches the rate limit expiry and falls back to `OPENAI_API_KEY` if configured. Wait for cooldown or upgrade to ChatGPT Pro ($200/mo) for higher limits.
 
 ### Empty or truncated responses
-With `xhigh` reasoning, the model uses more tokens for internal thinking. The proxy allows up to 128K output tokens by default. If responses seem cut off, check your Cursor `max_tokens` setting.
+With `high` reasoning, the model uses more tokens for internal thinking. The proxy sets `max_tokens=16384` by default when Cursor doesn't send one (which is typical for GPT models). If responses seem cut off, you can increase this in Cursor's settings.
 
 ### Token refresh fails
 If `codex login` was done long ago, the refresh token may have expired. Run `codex login` again to get fresh tokens.
+
+---
+
+## Technical Architecture: Stream Processing Pipeline
+
+When GPT-5.4 responses stream back from the Codex backend, CCProxy applies a series of fixes to ensure compatibility with Cursor:
+
+```
+Codex Backend → openai-oauth (Responses→Chat Completions SSE)
+    → fixToolCallFinishReason    — injects finish_reason: "tool_calls"
+    → fixApplyPatchFormat        — converts non-Cursor patch formats to ***
+    → debugWrapStream            — logs the final stream (when OPENAI_DEBUG=true)
+    → wrapStreamWithErrorHandling — catches usage_limit_reached etc.
+    → Cursor
+```
+
+### Key Fixes
+
+1. **finish_reason injection** (`fixToolCallFinishReason`): The openai-oauth library sometimes emits `finish_reason: null` when tool calls are returned. Cursor requires `finish_reason: "tool_calls"` to recognize that tool calls need executing — without it, Cursor drops the tool calls and re-sends the same history, creating an infinite loop. This wrapper detects tool call deltas in the SSE stream and rewrites/injects the correct finish_reason.
+
+2. **ApplyPatch format conversion** (`fixApplyPatchFormat`): Cursor's `ApplyPatch` tool expects a custom patch format using `*** Begin Patch`, `*** Add File:`, `*** Update File:`, `*** Delete File:`, `*** End Patch` headers. GPT-5.4 may generate standard unified diff format (`--- a/path`, `+++ b/path`) or V4A format (`{operation: {type, path, diff}}`). This wrapper buffers ApplyPatch tool call arguments, detects the wrong format, and converts to Cursor's *** format before forwarding. Detection uses inverted logic: if the patch is NOT already in Cursor format and looks like a diff → convert.
+
+3. **Error surfacing** (`wrapStreamWithErrorHandling`): When the Codex backend returns mid-stream errors (e.g., `usage_limit_reached`), the openai-oauth library aborts the stream. This wrapper catches stream aborts and converts them into proper SSE error events that Cursor can display to the user.
+
+### Debugging
+
+Set `OPENAI_DEBUG=true` in `.env` to enable detailed logging to `openai-debug.log`:
+- Full request/response metadata
+- Message-by-message breakdown with role counts
+- Complete ApplyPatch tool call arguments (with format detection)
+- Tool call loop detection warnings
+- Stream timing and chunk counts
 
 ---
 
@@ -247,7 +282,7 @@ If `codex login` was done long ago, the refresh token may have expired. Run `cod
 | | Codex Subscription (via CCProxy) | Direct API Key |
 |---|---|---|
 | **Cost** | Flat: $20/mo (Plus) or $200/mo (Pro) | Per-token: ~$2.50/$15 per 1M tokens |
-| **GPT-5.4 xhigh reasoning** | ✅ Included | ✅ Available (expensive) |
+| **GPT-5.4 high reasoning** | ✅ Included | ✅ Available (expensive) |
 | **1M context window** | ✅ Full | ✅ Full |
 | **Rate limits** | Subscription-tier limits | Pay-as-you-go |
 | **Setup** | `codex login` + CCProxy | Paste API key in Cursor |

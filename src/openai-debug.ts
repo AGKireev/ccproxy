@@ -18,7 +18,9 @@ let requestSeq = 0;
 
 // Clear log file on module load (server start)
 if (ENABLED && existsSync(LOG_FILE)) {
-  try { unlinkSync(LOG_FILE); } catch {}
+  try { unlinkSync(LOG_FILE); } catch (err) {
+    console.warn(`   ⚠️  [debug] Could not clear old debug log: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 function ts(): string {
@@ -28,6 +30,11 @@ function ts(): string {
 function write(line: string): void {
   if (!ENABLED) return;
   appendFileSync(LOG_FILE, line + "\n", "utf-8");
+}
+
+/** Public alias for write — used by other modules to add entries to the debug log. */
+export function debugWrite(line: string): void {
+  write(line);
 }
 
 function separator(): void {
@@ -242,6 +249,8 @@ export function debugWrapStream(
   let textContent = "";
   let toolCallNames: string[] = [];
   let finishReason = "";
+  // Track full ApplyPatch tool call arguments for logging
+  const applyPatchArgBuffers = new Map<number, string>();
 
   const wrappedStream = new ReadableStream({
     async pull(controller) {
@@ -287,6 +296,20 @@ export function debugWrapStream(
                 if (tc.function?.name) {
                   toolCallNames.push(tc.function.name);
                   write(`[${ts()}] STREAM #${info.seq} chunk ${chunkCount}: tool_call start → ${tc.function.name} (id=${tc.id || "?"})`);
+                  // Start tracking ApplyPatch arguments
+                  if (tc.function.name === "ApplyPatch" && tc.index != null) {
+                    applyPatchArgBuffers.set(tc.index, tc.function.arguments || "");
+                  }
+                }
+                // Accumulate ApplyPatch argument deltas
+                if (tc.index != null && applyPatchArgBuffers.has(tc.index) && tc.function?.arguments) {
+                  if (!tc.function.name) {
+                    // Continuation chunk (no name, just arguments delta)
+                    applyPatchArgBuffers.set(
+                      tc.index,
+                      (applyPatchArgBuffers.get(tc.index) || "") + tc.function.arguments
+                    );
+                  }
                 }
               }
             }
@@ -295,13 +318,64 @@ export function debugWrapStream(
               const fr = choice0.finish_reason;
               finishReason = fr === null ? "null" : String(fr);
               write(`[${ts()}] STREAM #${info.seq} chunk ${chunkCount}: finish_reason=${finishReason}`);
+
+              // Log full ApplyPatch arguments when stream finishes
+              if (applyPatchArgBuffers.size > 0) {
+                for (const [idx, args] of applyPatchArgBuffers) {
+                  if (args.length > 0) {
+                    write(`[${ts()}] STREAM #${info.seq} ApplyPatch args (index=${idx}, ${args.length}c):`);
+                    // Log the full patch content for diagnosis
+                    try {
+                      const parsed = JSON.parse(args);
+                      const patchContent = parsed.patch || parsed.input || JSON.stringify(parsed);
+                      const patchStr = typeof patchContent === "string" ? patchContent : JSON.stringify(patchContent);
+                      const patchLines = patchStr.split("\n");
+                      if (patchLines.length > 30) {
+                        write(`  ${patchLines.slice(0, 15).join("\n  ")}`);
+                        write(`  ... (${patchLines.length - 30} lines omitted) ...`);
+                        write(`  ${patchLines.slice(-15).join("\n  ")}`);
+                      } else {
+                        write(`  ${patchStr.replace(/\n/g, "\n  ")}`);
+                      }
+                      // Check format — comprehensive detection matching handler logic
+                      const hasCursorFormat = patchStr.includes("*** Begin Patch") ||
+                        patchStr.includes("*** Add File:") || patchStr.includes("*** Update File:") ||
+                        patchStr.includes("*** Delete File:");
+                      const hasUnifiedFormat = patchStr.includes("--- a/") || patchStr.includes("--- /dev/null") ||
+                        patchStr.includes("+++ b/") || /^diff --git /m.test(patchStr);
+                      const hasRawDiffPair = /^---\s+\S/m.test(patchStr) && /^\+\+\+\s+\S/m.test(patchStr);
+                      const hasRawHunks = /^@@\s/m.test(patchStr) && (/^\+[^+]/m.test(patchStr) || /^-[^-]/m.test(patchStr));
+
+                      let formatLabel: string;
+                      if (hasCursorFormat) {
+                        formatLabel = "Cursor *** ✓";
+                      } else if (hasUnifiedFormat) {
+                        formatLabel = "UNIFIED DIFF (wrong! should have been converted)";
+                      } else if (hasRawDiffPair) {
+                        formatLabel = "UNIFIED DIFF without a/b prefix (wrong! should have been converted)";
+                      } else if (hasRawHunks) {
+                        formatLabel = "RAW @@ HUNKS (wrong! should have been converted)";
+                      } else {
+                        formatLabel = "UNKNOWN FORMAT — may cause Cursor rejection";
+                      }
+                      write(`  Format: ${formatLabel}`);
+                      if (!hasCursorFormat) {
+                        console.warn(`   ⚠️  [debug] ApplyPatch reached Cursor in NON-Cursor format: ${formatLabel}. Preview: ${patchStr.substring(0, 150)}`);
+                      }
+                    } catch (patchParseErr) {
+                      write(`  (raw, ${args.length}c): ${args.substring(0, 500)}${args.length > 500 ? "..." : ""}`);
+                      console.warn(`   ⚠️  [debug] Could not parse ApplyPatch args as JSON: ${patchParseErr instanceof Error ? patchParseErr.message : "parse error"}`);
+                    }
+                  }
+                }
+              }
             }
             // Log errors in stream
             if (data?.error) {
               write(`[${ts()}] STREAM #${info.seq} chunk ${chunkCount}: ERROR ${JSON.stringify(data.error)}`);
             }
           } catch {
-            // Not JSON, skip
+            // SSE line isn't valid JSON — normal for partial TCP chunks, don't log noise
           }
         }
       } catch (error) {
