@@ -1,6 +1,7 @@
 /**
  * /v1/chat/completions endpoint handler
- * Converts OpenAI chat completion format to Anthropic and proxies the request
+ * Converts OpenAI chat completion format to Anthropic and proxies the request.
+ * Also handles OpenAI models via Codex subscription proxy.
  */
 
 import {
@@ -24,6 +25,7 @@ import {
 } from "../server";
 import { logger } from "../logger";
 import { getConfig } from "../config";
+import { isOpenAIModel, handleOpenAICodexRequest } from "../openai-codex-handler";
 
 export async function handleOpenAIRequest(req: Request): Promise<Response> {
   try {
@@ -97,7 +99,27 @@ export async function handleOpenAIRequest(req: Request): Promise<Response> {
 
     console.log(`\n   Body Preview: ${truncatedBody}`);
 
-    // Passthrough to OpenAI/OpenRouter for non-Claude models
+    // Route OpenAI models (GPT, o-series) through openai-oauth library.
+    // The library handles ALL conversion (Chat Completions ↔ Responses API),
+    // OAuth auth, token refresh, streaming, tool calls — everything.
+    if (isOpenAIModel(openaiBody.model)) {
+      console.log(
+        `\n→ [OpenAI via openai-oauth] ${openaiBody.model} | ${
+          openaiBody.stream ? "stream" : "sync"
+        }`
+      );
+
+      // Reconstruct a Request with the parsed body (we already consumed req.json())
+      const codexReq = new Request(req.url, {
+        method: "POST",
+        headers: req.headers,
+        body: JSON.stringify(openaiBody),
+      });
+
+      return handleOpenAICodexRequest(codexReq);
+    }
+
+    // Passthrough to OpenAI/OpenRouter for non-Claude, non-GPT models
     if (shouldPassthroughToOpenAI(openaiBody.model)) {
       console.log(
         `\n→ [OpenAI Passthrough] ${openaiBody.model} | ${

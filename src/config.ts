@@ -10,6 +10,19 @@ export const CLAUDE_CREDENTIALS_PATH = join(
 export const CLAUDE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 export const ANTHROPIC_TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
 export const ANTHROPIC_API_URL = "https://api.anthropic.com";
+
+// --- OpenAI Codex OAuth constants ---
+export const OPENAI_CODEX_CREDENTIALS_PATH = join(
+  homedir(),
+  ".ccproxy",
+  "openai-credentials.json"
+);
+// OpenAI Codex CLI client ID (from official Codex CLI)
+export const OPENAI_CODEX_CLIENT_ID = process.env.OPENAI_CODEX_CLIENT_ID || "app_EMoamEEZ73f0CkXaXp7hrann";
+export const OPENAI_AUTH_URL = "https://auth.openai.com/oauth/authorize";
+export const OPENAI_TOKEN_URL = "https://auth.openai.com/oauth/token";
+export const OPENAI_CODEX_API_URL = "https://chatgpt.com/backend-api/codex";
+// Callback port removed — we use the official Codex CLI for authentication instead of browser OAuth
 // Required beta headers for Claude Code OAuth
 export const ANTHROPIC_BETA_OAUTH = "oauth-2025-04-20";
 export const ANTHROPIC_BETA_CLAUDE_CODE = "claude-code-20250219";
@@ -98,6 +111,10 @@ export function getConfig(): ProxyConfig {
     // Proxy secret key: when set, all /v1/* requests must include this as Bearer token.
     // Cursor sends the "API Key" field as Authorization: Bearer <key>.
     proxySecretKey: process.env.PROXY_SECRET_KEY || undefined,
+    // OpenAI Codex subscription proxy (auto-detected from credentials)
+    openaiCodexFirst: process.env.OPENAI_CODEX_FIRST !== "false",
+    openaiCodexDefaultModel: process.env.OPENAI_CODEX_DEFAULT_MODEL || "gpt-5.4",
+    openaiCodexReasoningEffort: process.env.OPENAI_CODEX_REASONING_EFFORT || "xhigh",
   };
 
   return cachedConfig;

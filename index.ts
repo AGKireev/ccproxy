@@ -9,8 +9,8 @@ console.log(`
 ╔═══════════════════════════════════════════════════════════════╗
 ║                 Claude Code Proxy (CCProxy)                   ║
 ╠═══════════════════════════════════════════════════════════════╣
-║  Smart proxy with server-side compaction for Opus 4.6.        ║
-║  Routes through Claude Code subscription, falls back to API.  ║
+║  Smart proxy for Claude Code & OpenAI Codex subscriptions.    ║
+║  Routes through OAuth subscriptions, falls back to API keys.  ║
 ╚═══════════════════════════════════════════════════════════════╝
 `);
 
@@ -19,14 +19,16 @@ console.log(`   Anthropic:  http://localhost:${server.port}/v1/messages`);
 console.log(
   `   OpenAI:     http://localhost:${server.port}/v1/chat/completions`
 );
+console.log(`   Models:     http://localhost:${server.port}/v1/models`);
 
 await checkCredentials();
 
-if (isOpenAIPassthroughEnabled()) {
-  console.log(`✓ OpenAI passthrough enabled → ${config.openaiBaseUrl}`);
-} else {
-  console.log("⚠️  No OPENAI_API_KEY (non-Claude models will fail)");
-}
+// OpenAI model routing: auto-detected from ~/.codex/auth.json (via openai-oauth library)
+// The openai-oauth library handles all conversion, auth, streaming, tool calls.
+console.log(`\n📋 OpenAI model settings (powered by openai-oauth):`);
+console.log(`  Reasoning effort: ${config.openaiCodexReasoningEffort}`);
+console.log(`  Auth status: http://localhost:${server.port}/auth/openai/status`);
+console.log(`  Setup help: http://localhost:${server.port}/auth/openai/login`);
 
 if (config.compactionEnabled) {
   console.log(`✓ Server-side compaction enabled (trigger: ${config.compactionTriggerTokens} tokens, Opus 4.6+ only)`);
@@ -54,7 +56,14 @@ if (config.proxySecretKey) {
 }
 
 if (process.env.VERBOSE_LOGGING === "true") {
-  console.log(`\n📝 Verbose file logging enabled → api.log (gitignored)\n`);
+  console.log(`\n📝 Verbose file logging enabled → api.log (gitignored)`);
 } else {
-  console.log(`\n📝 Verbose file logging disabled (set VERBOSE_LOGGING=true to enable)\n`);
+  console.log(`\n📝 Verbose file logging disabled (set VERBOSE_LOGGING=true to enable)`);
 }
+
+if (process.env.OPENAI_DEBUG === "true") {
+  console.log(`🔍 OpenAI debug logging enabled → openai-debug.log (full request/response/SSE capture)`);
+} else {
+  console.log(`📝 OpenAI debug logging disabled (set OPENAI_DEBUG=true to enable)`);
+}
+console.log();

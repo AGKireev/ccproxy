@@ -22,6 +22,31 @@ export interface TokenRefreshResponse {
   scope: string;
 }
 
+// --- OpenAI Codex OAuth types ---
+
+export interface OpenAICredentials {
+  accessToken: string;
+  refreshToken: string;
+  expiresAt: number;
+  accountId: string;
+}
+
+export interface OpenAITokenInfo {
+  accessToken: string;
+  refreshToken: string;
+  expiresAt: number;
+  accountId: string;
+  isExpired: boolean;
+}
+
+export interface OpenAITokenRefreshResponse {
+  access_token: string;
+  refresh_token: string;
+  expires_in: number;
+  token_type: string;
+  scope?: string;
+}
+
 export interface AnthropicMessage {
   role: "user" | "assistant";
   content: string | ContentBlock[];
@@ -122,4 +147,8 @@ export interface ProxyConfig {
   compactionTriggerTokens: number;
   tokenInflationEnabled: boolean;
   proxySecretKey?: string;
+  // OpenAI Codex subscription proxy
+  openaiCodexFirst: boolean;
+  openaiCodexDefaultModel: string;
+  openaiCodexReasoningEffort: string;
 }

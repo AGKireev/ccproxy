@@ -39,3 +39,7 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 cloudflared-config.yml
 cloudflared-config-server.yml
 start-proxy*
+
+# Diagnostic files
+openai-codex-*.json
+openai-debug.log

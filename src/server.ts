@@ -10,6 +10,7 @@ import { handleAnthropicRequest } from "./routes/anthropic";
 import { handleOpenAIRequest } from "./routes/openai";
 import { handleModelsRequest } from "./routes/models";
 import type { AnthropicError } from "./types";
+import { loadOpenAICredentials, getValidOpenAIToken, manualOpenAILogin, getAuthFileLocations, resetCodexAvailabilityCache } from "./openai-oauth";
 
 const config = getConfig();
 
@@ -240,6 +241,103 @@ export function startServer() {
         return new Response("OK", { status: 200 });
       }
 
+      // --- OpenAI auth endpoints (no proxy auth required) ---
+
+      // Login instructions
+      if (url.pathname === "/auth/openai/login" && req.method === "GET") {
+        const locations = getAuthFileLocations();
+        return new Response(
+          `<html><body style="font-family: system-ui; max-width: 700px; margin: 40px auto; padding: 0 20px;">
+<h1>OpenAI Codex Login</h1>
+<p>CCProxy reads credentials from the <strong>official Codex CLI</strong>. To authenticate:</p>
+
+<h2>Step 1: Install OpenAI Codex CLI</h2>
+<pre style="background:#f5f5f5;padding:12px;border-radius:6px;">npm install -g @openai/codex</pre>
+
+<h2>Step 2: Login</h2>
+<pre style="background:#f5f5f5;padding:12px;border-radius:6px;">codex login</pre>
+<p>This opens your browser, you sign in with your ChatGPT account, and tokens are saved automatically.</p>
+
+<h2>Step 3: Restart CCProxy</h2>
+<p>CCProxy will automatically pick up the credentials from:</p>
+<ul>${locations.map(l => `<li><code>${l}</code></li>`).join("\n")}</ul>
+
+<h2>Alternative: Manual Token Input</h2>
+<p>POST to <code>/auth/openai/manual</code> with:</p>
+<pre style="background:#f5f5f5;padding:12px;border-radius:6px;">curl -X POST http://localhost:${config.port}/auth/openai/manual \\
+  -H "Content-Type: application/json" \\
+  -d '{"access_token": "...", "refresh_token": "...", "account_id": "..."}'</pre>
+
+<h2>Current Status</h2>
+<p>Check: <a href="/auth/openai/status">/auth/openai/status</a></p>
+</body></html>`,
+          { headers: { "Content-Type": "text/html" } }
+        );
+      }
+
+      // Manual token login
+      if (url.pathname === "/auth/openai/manual" && req.method === "POST") {
+        try {
+          const body = await req.json() as {
+            access_token: string;
+            refresh_token: string;
+            account_id?: string;
+            id_token?: string;
+          };
+
+          if (!body.access_token || !body.refresh_token) {
+            return Response.json(
+              { error: "access_token and refresh_token are required" },
+              { status: 400 }
+            );
+          }
+
+          const creds = await manualOpenAILogin(
+            body.access_token,
+            body.refresh_token,
+            body.account_id,
+            body.id_token
+          );
+
+          if (creds) {
+            resetCodexAvailabilityCache();
+            return Response.json({
+              status: "ok",
+              message: "OpenAI credentials saved — GPT models are now available",
+              account_id: creds.accountId,
+            });
+          }
+
+          return Response.json(
+            { error: "Failed to save credentials. Could not determine account ID. Provide account_id explicitly." },
+            { status: 400 }
+          );
+        } catch (error) {
+          return Response.json(
+            { error: `Invalid request: ${error}` },
+            { status: 400 }
+          );
+        }
+      }
+
+      // Check OpenAI auth status
+      if (url.pathname === "/auth/openai/status" && req.method === "GET") {
+        const token = await getValidOpenAIToken();
+        if (token) {
+          const expiresIn = Math.round((token.expiresAt - Date.now()) / 1000 / 60);
+          return Response.json({
+            authenticated: true,
+            account_id: token.accountId,
+            expires_in_minutes: expiresIn,
+          });
+        }
+        return Response.json({
+          authenticated: false,
+          message: "Not authenticated. Run 'codex login' or POST to /auth/openai/manual",
+          auth_file_locations: getAuthFileLocations(),
+        });
+      }
+
       // Anthropic-compatible endpoint
       if (url.pathname === "/v1/messages" && req.method === "POST") {
         return handleAnthropicRequest(req);
@@ -273,6 +371,9 @@ export function startServer() {
 }
 
 export async function checkCredentials(): Promise<boolean> {
+  let hasAnyCreds = false;
+
+  // --- Check Claude Code credentials ---
   const creds = await loadCredentials();
   if (!creds?.claudeAiOauth) {
     console.log("\n⚠️  No Claude Code credentials found.");
@@ -281,28 +382,50 @@ export async function checkCredentials(): Promise<boolean> {
 
     if (config.anthropicApiKey) {
       console.log("✓ Fallback ANTHROPIC_API_KEY is configured");
-      return true;
+      hasAnyCreds = true;
+    } else {
+      console.log("⚠️  No ANTHROPIC_API_KEY fallback configured either.");
+    }
+  } else {
+    console.log("✓ Claude Code credentials loaded");
+    hasAnyCreds = true;
+
+    const token = await getValidToken();
+    if (token) {
+      const expiresIn = Math.round((token.expiresAt - Date.now()) / 1000 / 60);
+      console.log(`  Token expires in ${expiresIn} minutes`);
     }
 
-    console.log("⚠️  No ANTHROPIC_API_KEY fallback configured either.");
-    return false;
+    if (config.anthropicApiKey) {
+      console.log("✓ Fallback ANTHROPIC_API_KEY configured");
+    } else {
+      console.log(
+        "⚠️  No fallback ANTHROPIC_API_KEY (will fail if Claude Code limits hit)"
+      );
+    }
   }
 
-  console.log("✓ Claude Code credentials loaded");
-
-  const token = await getValidToken();
-  if (token) {
-    const expiresIn = Math.round((token.expiresAt - Date.now()) / 1000 / 60);
-    console.log(`  Token expires in ${expiresIn} minutes`);
-  }
-
-  if (config.anthropicApiKey) {
-    console.log("✓ Fallback ANTHROPIC_API_KEY configured");
+  // --- Check OpenAI Codex credentials (auto-detected) ---
+  const openaiCreds = await loadOpenAICredentials();
+  if (openaiCreds) {
+    hasAnyCreds = true;
+    console.log("✓ OpenAI Codex credentials found — GPT models will use your ChatGPT subscription");
+    const openaiToken = await getValidOpenAIToken();
+    if (openaiToken) {
+      const expiresIn = Math.round((openaiToken.expiresAt - Date.now()) / 1000 / 60);
+      console.log(`  OpenAI token expires in ${expiresIn} minutes`);
+      console.log(`  Account ID: ${openaiToken.accountId}`);
+    }
   } else {
-    console.log(
-      "⚠️  No fallback ANTHROPIC_API_KEY (will fail if Claude Code limits hit)"
-    );
+    console.log("\nℹ️  No OpenAI Codex credentials found (GPT models won't work until you authenticate)");
+    console.log("   To enable GPT models, run: codex login");
+    console.log("   Or set OPENAI_API_KEY in .env for API key access");
+
+    if (config.openaiApiKey) {
+      console.log("✓ OPENAI_API_KEY configured — GPT models will use API key");
+      hasAnyCreds = true;
+    }
   }
 
-  return true;
+  return hasAnyCreds;
 }
