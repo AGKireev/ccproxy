@@ -1,18 +1,26 @@
 /**
- * OpenAI Codex handler using the openai-oauth library.
+ * OpenAI Codex handler — production architecture.
  *
- * Cursor sends messages in Responses API item format mixed with Chat Completions:
- *   - {role: "assistant", content: [{type: "output_text", text: "..."}]}
- *   - {type: "function_call", call_id, name, arguments}  (no role!)
- *   - {type: "function_call_output", call_id, output: [{type: "input_text", text: "..."}]}  (no role!)
- *   - {role: "user", content: [{type: "input_text", text: "..."}]}
+ * Architecture:
+ *   Cursor → /v1/chat/completions (mixed format) → CCProxy → normalize
+ *   → openai-oauth /v1/chat/completions → Codex backend
+ *   → openai-oauth Chat Completions SSE → CCProxy repair wrapper → Cursor
  *
- * The openai-oauth library (Vercel AI SDK) expects PURE OpenAI Chat Completions format:
- *   - {role: "assistant", content: "text", tool_calls: [...]}
- *   - {role: "tool", content: "text", tool_call_id: "..."}
- *   - {role: "user", content: "text" | [{type: "text", text: "..."}, {type: "image_url", ...}]}
+ * Key insight:
+ *   - openai-oauth's /v1/chat/completions path streams real GPT-5.4 output quickly,
+ *     even for large Cursor agent payloads
+ *   - but that stream can end tool-calling turns with finish_reason: null, which
+ *     breaks Cursor's tool execution loop
+ *   - raw /v1/responses passthrough looked cleaner, but in practice it can sit on
+ *     a 200 OK stream without producing visible assistant output for too long
  *
- * This module normalizes Cursor's format before passing to the library.
+ * So the stable production path is:
+ *   1. normalize Cursor's hybrid messages/tools
+ *   2. execute through openai-oauth's chat-completions handler
+ *   3. repair the emitted SSE so Cursor gets proper finish_reason/error behavior
+ *
+ * The Responses API conversion helpers remain in this file as reference/experimental
+ * code, but they are not the active execution path.
  */
 
 import { createOpenAIOAuthFetchHandler } from "openai-oauth";
@@ -28,7 +36,7 @@ import {
 
 let handler: ((request: Request) => Promise<Response>) | null = null;
 
-// Track the last error from openai-oauth for enriching stream errors
+// Track the last error from openai-oauth for diagnostic logging
 let lastCodexError: { message: string; durationMs: number; timestamp: number } | null = null;
 
 function getHandler(): (request: Request) => Promise<Response> {
@@ -55,855 +63,10 @@ function getHandler(): (request: Request) => Promise<Response> {
   return handler;
 }
 
-// ── finish_reason fixer ─────────────────────────────────────────────────
-// The openai-oauth library (via Vercel AI SDK) sometimes emits finish_reason: null
-// even when the model returned tool calls. Cursor relies on finish_reason: "tool_calls"
-// to know that tool calls need executing; without it, Cursor drops the tool_calls
-// from the assistant message, never executes them, and sends the same history back,
-// causing an infinite loop.
-//
-// This wrapper tracks tool_call deltas in the SSE stream and:
-//  1. Rewrites finish_reason: null → "tool_calls" if tool call chunks were seen
-//  2. Injects a finish_reason chunk if the stream ends without one
-
-function fixToolCallFinishReason(response: Response): Response {
-  const contentType = response.headers.get("content-type") || "";
-  if (!contentType.includes("text/event-stream") || !response.body) {
-    console.log("   [finish-fix] SKIP: not SSE or no body");
-    return response;
-  }
-
-  console.log("   [finish-fix] Active — wrapping SSE stream (split-safe tool detection)");
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  const encoder = new TextEncoder();
-
-  let hasToolCalls = false;
-  let emittedToolCallsFinish = false;
-  let lastId = "chatcmpl-proxy";
-  let lastModel = "gpt-5.4";
-  let readCount = 0;
-  let isCancelled = false;
-  // CRITICAL: TCP can split JSON mid-string. A single read may not contain the full
-  // substring "tool_calls", so we keep a sliding tail and scan (carry + chunk).
-  let scanCarry = "";
-
-  const wrappedStream = new ReadableStream({
-    async pull(controller) {
-      if (isCancelled) return;
-      try {
-        const { done, value } = await reader.read();
-        if (isCancelled) return; // Cursor cancelled while we were waiting for data
-        readCount++;
-
-        if (done) {
-          console.log(
-            `   [finish-fix] Stream done after ${readCount} reads. hasToolCalls=${hasToolCalls}, emittedFinish=${emittedToolCallsFinish}`
-          );
-          if (hasToolCalls && !emittedToolCallsFinish) {
-            console.log("   🔧 [OpenAI Codex] Injecting finish_reason: tool_calls at stream end (split-safe fallback)");
-            const finishChunk = `data: ${JSON.stringify({
-              id: lastId,
-              object: "chat.completion.chunk",
-              created: Math.floor(Date.now() / 1000),
-              model: lastModel,
-              choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
-            })}\n\n`;
-            controller.enqueue(encoder.encode(finishChunk));
-          }
-          controller.close();
-          return;
-        }
-
-        const text = decoder.decode(value, { stream: true });
-
-        // Split-safe: "tool_calls" may span chunk boundaries (e.g. ..."tool_ | calls":...)
-        const combined = scanCarry + text;
-        if (combined.includes('"tool_calls"')) {
-          if (!hasToolCalls) {
-            console.log(`   [finish-fix] Detected tool_calls (split-safe) on read #${readCount}`);
-          }
-          hasToolCalls = true;
-        }
-        scanCarry = combined.slice(-64);
-
-        // Real finish_reason as a quoted string (not null)
-        const finishMatch = text.match(/"finish_reason"\s*:\s*"([^"]+)"/);
-        if (finishMatch) {
-          emittedToolCallsFinish = true;
-          if (readCount <= 3) {
-            console.log(`   [finish-fix] Found real finish_reason: "${finishMatch[1]}" in read #${readCount}`);
-          }
-        }
-
-        if (hasToolCalls && !emittedToolCallsFinish) {
-          // Inject before [DONE] when it appears whole in this chunk
-          if (text.includes("data: [DONE]")) {
-            console.log("   🔧 [OpenAI Codex] Injecting finish_reason: tool_calls before [DONE]");
-            const finishEvent = `data: ${JSON.stringify({
-              id: lastId,
-              object: "chat.completion.chunk",
-              created: Math.floor(Date.now() / 1000),
-              model: lastModel,
-              choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
-            })}\n\n`;
-            const modified = text.replace(/data: \[DONE\]/g, finishEvent + "data: [DONE]");
-            emittedToolCallsFinish = true;
-            controller.enqueue(encoder.encode(modified));
-            return;
-          }
-
-          const emptyDeltaFinish = /"delta"\s*:\s*\{\s*\}\s*,\s*"finish_reason"\s*:\s*null/;
-          if (emptyDeltaFinish.test(text)) {
-            console.log("   🔧 [OpenAI Codex] Rewriting finish_reason: null → tool_calls");
-            const modified = text.replace(
-              emptyDeltaFinish,
-              '"delta":{},"finish_reason":"tool_calls"'
-            );
-            emittedToolCallsFinish = true;
-            controller.enqueue(encoder.encode(modified));
-            return;
-          }
-        }
-
-        if (readCount <= 3) {
-          const idMatch = text.match(/"id"\s*:\s*"([^"]+)"/);
-          if (idMatch) lastId = idMatch[1];
-          const modelMatch = text.match(/"model"\s*:\s*"([^"]+)"/);
-          if (modelMatch) lastModel = modelMatch[1];
-        }
-
-        controller.enqueue(value);
-      } catch (error) {
-        if (isCancelled) return; // Don't re-throw if Cursor cancelled
-        throw error;
-      }
-    },
-    cancel() {
-      isCancelled = true;
-      reader.cancel();
-    },
-  });
-
-  const headers = new Headers(response.headers);
-  return new Response(wrappedStream, { status: response.status, headers });
-}
-
-// ── ApplyPatch format converter (safety net) ────────────────────────────
-// GPT-5.4 may generate patches in standard unified diff format (--- a/ +++ b/)
-// or V4A format ({operation: {type, path, diff}}) instead of Cursor's custom
-// *** Add File / *** Update File / *** Delete File format. This converter
-// detects the wrong format and converts it.
-
-/**
- * Check if a patch string needs conversion.
- *
- * INVERTED LOGIC: Instead of trying to detect every possible "wrong" format
- * (unified diff, V4A, raw hunks, etc.), we check if it's ALREADY valid Cursor
- * *** format. If it's NOT in Cursor format and looks like a diff → convert.
- *
- * This catches all non-Cursor formats GPT-5.4 might generate:
- *  - Standard unified diff with `--- a/path` / `+++ b/path`
- *  - Unified diff without prefix: `--- path/to/file` / `+++ path/to/file`
- *  - Raw @@ hunks without any file headers
- *  - Any other diff-like content with -/+ lines
- */
-function needsPatchFormatConversion(patch: string): boolean {
-  const trimmed = patch.trim();
-  if (!trimmed) return false;
-
-  // Already in Cursor format — no conversion needed
-  if (trimmed.includes("*** Begin Patch") || trimmed.includes("*** Add File:") ||
-      trimmed.includes("*** Update File:") || trimmed.includes("*** Delete File:")) {
-    return false;
-  }
-
-  // Standard unified diff markers (most common GPT output)
-  if (trimmed.includes("--- /dev/null") || trimmed.match(/^diff --git /m)) {
-    return true;
-  }
-
-  // Unified diff with or without a/ b/ prefix:
-  //   "--- a/path" OR "--- path/to/file" (but NOT "--- some prose sentence")
-  // We look for --- followed by +++ within a few lines (diff header pair)
-  if (/^---\s+\S/m.test(trimmed) && /^\+\+\+\s+\S/m.test(trimmed)) {
-    return true;
-  }
-
-  // Raw @@ hunk markers with diff content lines — this is a diff without file headers
-  if (/^@@\s/m.test(trimmed) && (/^\+[^+]/m.test(trimmed) || /^-[^-]/m.test(trimmed))) {
-    return true;
-  }
-
-  return false;
-}
-
-/**
- * Convert a standard unified diff or multi-file diff into Cursor's *** format.
- *
- * Handles multiple input variations GPT-5.4 may produce:
- *
- * 1. Standard unified diff with a/b prefix:
- *    diff --git a/path b/path
- *    --- a/path  OR  --- /dev/null
- *    +++ b/path
- *    @@ -N,M +N,M @@
- *
- * 2. Unified diff WITHOUT a/b prefix:
- *    --- path/to/file
- *    +++ path/to/file
- *    @@ -N,M +N,M @@
- *
- * 3. Raw @@ hunks without any file headers:
- *    @@ ... @@
- *    -removed
- *    +added
- *     context
- *
- * Output format (Cursor):
- *   *** Begin Patch
- *   *** Add File: path         (if --- /dev/null)
- *   *** Update File: path      (if existing file)
- *   *** Delete File: path      (if +++ /dev/null or deleted file mode)
- *   @@
- *   -removed
- *   +added
- *    context
- *   *** End Patch
- */
-function convertUnifiedDiffToCursorFormat(diff: string): string {
-  const lines = diff.split("\n");
-  const outputSections: string[] = [];
-  let currentPath = "";
-  let currentIsNew = false;
-  let currentIsDelete = false;
-  let currentHunkLines: string[] = [];
-  let inHunk = false;
-  let hasFileHeaders = false;  // Track if we found --- / +++ headers
-
-  function flushSection(): void {
-    if (!currentPath && currentHunkLines.length === 0) return;
-
-    if (currentIsDelete) {
-      outputSections.push(`*** Delete File: ${currentPath || "unknown"}`);
-    } else if (currentIsNew) {
-      outputSections.push(`*** Add File: ${currentPath || "unknown"}`);
-      for (const hl of currentHunkLines) {
-        outputSections.push(hl);
-      }
-    } else {
-      outputSections.push(`*** Update File: ${currentPath || "unknown"}`);
-      for (const hl of currentHunkLines) {
-        outputSections.push(hl);
-      }
-    }
-    currentPath = "";
-    currentIsNew = false;
-    currentIsDelete = false;
-    currentHunkLines = [];
-    inHunk = false;
-  }
-
-  for (const line of lines) {
-    // Skip "diff --git" headers, but extract path from them
-    if (line.startsWith("diff --git ")) {
-      flushSection();
-      // Extract path from "diff --git a/path b/path"
-      const match = line.match(/diff --git\s+(?:a\/)?(\S+)\s+(?:b\/)?(\S+)/);
-      if (match) {
-        currentPath = match[2] || match[1] || "";
-      }
-      continue;
-    }
-
-    // Detect deleted file mode
-    if (line.startsWith("deleted file mode")) {
-      currentIsDelete = true;
-      continue;
-    }
-
-    // New file mode
-    if (line.startsWith("new file mode")) {
-      currentIsNew = true;
-      continue;
-    }
-
-    // --- line: old file path
-    if (line.startsWith("--- ")) {
-      flushSection();
-      hasFileHeaders = true;
-      const path = line.substring(4).trim();
-      if (path === "/dev/null" || path === "a//dev/null") {
-        currentIsNew = true;
-      } else {
-        // Strip "a/" prefix if present (handles both "--- a/path" and "--- path")
-        currentPath = path.replace(/^a\//, "");
-      }
-      continue;
-    }
-
-    // +++ line: new file path
-    if (line.startsWith("+++ ")) {
-      hasFileHeaders = true;
-      const path = line.substring(4).trim();
-      if (path === "/dev/null" || path === "b//dev/null") {
-        currentIsDelete = true;
-        // Use old path if we have it
-      } else {
-        // Strip "b/" prefix if present, use this as the canonical path
-        currentPath = path.replace(/^b\//, "");
-      }
-      continue;
-    }
-
-    // @@ hunk header — simplify to just @@
-    if (line.startsWith("@@ ")) {
-      // If we have @@ hunks but no file headers, this is a raw diff
-      // We need at least a placeholder path (will be resolved later)
-      if (!hasFileHeaders && !currentPath && currentHunkLines.length === 0) {
-        // Mark that we're in a headerless diff; path stays empty for now
-      }
-      currentHunkLines.push("@@");
-      inHunk = true;
-      continue;
-    }
-
-    // Bare @@ without trailing content (some models emit just "@@")
-    if (line.trim() === "@@") {
-      currentHunkLines.push("@@");
-      inHunk = true;
-      continue;
-    }
-
-    // Content lines within a hunk (or new file content)
-    if (inHunk || currentIsNew) {
-      if (line.startsWith("+") || line.startsWith("-") || line.startsWith(" ") || line === "") {
-        currentHunkLines.push(line);
-      } else if (line.startsWith("\\")) {
-        // "\ No newline at end of file" — skip
-        continue;
-      }
-      continue;
-    }
-
-    // Skip other metadata lines (index, similarity, etc.)
-  }
-
-  flushSection();
-
-  if (outputSections.length === 0) {
-    // Nothing was converted — return original
-    return diff;
-  }
-
-  return "*** Begin Patch\n" + outputSections.join("\n") + "\n*** End Patch";
-}
-
-/**
- * Try to convert V4A operation JSON format to Cursor format.
- * V4A format: {callId: "...", operation: {type: "create_file"|"update_file"|"delete_file", path: "...", diff: "..."}}
- */
-function convertV4AToCursorFormat(argsJson: Record<string, unknown>): string | null {
-  const op = argsJson.operation as Record<string, unknown> | undefined;
-  if (!op || typeof op.type !== "string") return null;
-
-  const path = (op.path || "") as string;
-  const diff = (op.diff || "") as string;
-
-  const sections: string[] = [];
-
-  switch (op.type) {
-    case "create_file":
-      sections.push(`*** Add File: ${path}`);
-      // V4A create diffs have all lines starting with +
-      for (const line of diff.split("\n")) {
-        if (line.startsWith("@@")) {
-          // Skip V4A @@ headers for create files
-          continue;
-        }
-        sections.push(line);
-      }
-      break;
-    case "update_file":
-      sections.push(`*** Update File: ${path}`);
-      for (const line of diff.split("\n")) {
-        sections.push(line);
-      }
-      break;
-    case "delete_file":
-      sections.push(`*** Delete File: ${path}`);
-      break;
-    default:
-      return null;
-  }
-
-  return "*** Begin Patch\n" + sections.join("\n") + "\n*** End Patch";
-}
-
-/**
- * Attempt to fix the ApplyPatch tool call arguments if they use the wrong format.
- * Returns the fixed arguments JSON string, or the original if no fix needed.
- */
-function fixApplyPatchArgs(argsStr: string): { fixed: string; converted: boolean } {
-  try {
-    const args = JSON.parse(argsStr);
-
-    // Case 1: V4A operation format from native apply_patch
-    // {callId: "...", operation: {type: "create_file"|"update_file"|"delete_file", path: "...", diff: "..."}}
-    if (args.operation && typeof args.operation === "object") {
-      const converted = convertV4AToCursorFormat(args);
-      if (converted) {
-        console.log(`   [patch-fix] Converted V4A operation format → Cursor *** format`);
-        return { fixed: JSON.stringify({ patch: converted }), converted: true };
-      }
-    }
-
-    // Case 2: Has a "patch" field — check if it needs conversion
-    if (typeof args.patch === "string" && needsPatchFormatConversion(args.patch)) {
-      const converted = convertUnifiedDiffToCursorFormat(args.patch);
-      console.log(`   [patch-fix] Converted non-Cursor diff (patch field) → Cursor *** format`);
-      return { fixed: JSON.stringify({ ...args, patch: converted }), converted: true };
-    }
-
-    // Case 3: Has an "input" field (OpenClaw/Codex style)
-    if (typeof args.input === "string" && needsPatchFormatConversion(args.input)) {
-      const converted = convertUnifiedDiffToCursorFormat(args.input);
-      console.log(`   [patch-fix] Converted non-Cursor diff (input field) → Cursor *** format`);
-      return { fixed: JSON.stringify({ ...args, patch: converted }), converted: true };
-    }
-
-    // Case 4: Has a "diff" field (some models use this instead of "patch")
-    if (typeof args.diff === "string" && needsPatchFormatConversion(args.diff)) {
-      const converted = convertUnifiedDiffToCursorFormat(args.diff);
-      console.log(`   [patch-fix] Converted non-Cursor diff (diff field) → Cursor *** format`);
-      return { fixed: JSON.stringify({ ...args, patch: converted }), converted: true };
-    }
-
-    // Case 5: Has a "content" field (another common variant)
-    if (typeof args.content === "string" && needsPatchFormatConversion(args.content)) {
-      const converted = convertUnifiedDiffToCursorFormat(args.content);
-      console.log(`   [patch-fix] Converted non-Cursor diff (content field) → Cursor *** format`);
-      return { fixed: JSON.stringify({ ...args, patch: converted }), converted: true };
-    }
-
-  } catch (parseErr) {
-    // argsStr isn't valid JSON — might be raw diff text
-    console.warn(`   ⚠️  [patch-fix] ApplyPatch args are not valid JSON (${parseErr instanceof Error ? parseErr.message : "parse error"}). Length: ${argsStr.length}c. Preview: ${argsStr.substring(0, 200)}`);
-    if (needsPatchFormatConversion(argsStr)) {
-      const converted = convertUnifiedDiffToCursorFormat(argsStr);
-      console.log(`   [patch-fix] Converted raw diff text → Cursor *** format`);
-      return { fixed: JSON.stringify({ patch: converted }), converted: true };
-    }
-  }
-
-  return { fixed: argsStr, converted: false };
-}
-
-// ── ApplyPatch format stream fixer ──────────────────────────────────────
-// This wrapper intercepts the SSE stream and fixes ApplyPatch tool call arguments
-// that use the wrong diff format before they reach Cursor.
-
-function fixApplyPatchFormat(response: Response): Response {
-  const contentType = response.headers.get("content-type") || "";
-  if (!contentType.includes("text/event-stream") || !response.body) {
-    return response;
-  }
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  const encoder = new TextEncoder();
-
-  // Track ongoing ApplyPatch tool calls by index
-  // Key: tool call index, Value: accumulated arguments string
-  const applyPatchArgs = new Map<number, string>();
-  let hasApplyPatch = false;
-  let readCount = 0;
-  let isCancelled = false;
-
-  // Buffer for chunks while we're accumulating ApplyPatch args
-  // Once we see finish_reason, we can emit all buffered chunks (possibly modified)
-  let bufferedChunks: Uint8Array[] = [];
-  let bufferedTexts: string[] = [];
-  let isBuffering = false;
-
-  const wrappedStream = new ReadableStream({
-    async pull(controller) {
-      if (isCancelled) return;
-      try {
-        const { done, value } = await reader.read();
-        if (isCancelled) return;
-        readCount++;
-
-        if (done) {
-          // Flush any remaining buffered chunks
-          if (isBuffering && bufferedChunks.length > 0) {
-            emitBufferedChunks(controller);
-          }
-          controller.close();
-          return;
-        }
-
-        const text = decoder.decode(value, { stream: true });
-
-        // Parse SSE events to detect ApplyPatch tool calls
-        const sseLines = text.split("\n");
-        for (const line of sseLines) {
-          if (!line.startsWith("data: ") || line === "data: [DONE]") continue;
-          try {
-            const data = JSON.parse(line.substring(6));
-            const delta = data?.choices?.[0]?.delta;
-
-            // Detect tool call start with name "ApplyPatch"
-            if (delta?.tool_calls) {
-              for (const tc of delta.tool_calls) {
-                if (tc.function?.name === "ApplyPatch" && tc.index != null) {
-                  applyPatchArgs.set(tc.index, "");
-                  hasApplyPatch = true;
-                  isBuffering = true;
-                  console.log(`   [patch-fix] Detected ApplyPatch tool call start (index=${tc.index})`);
-                }
-                // Accumulate arguments for tracked ApplyPatch calls
-                if (tc.index != null && applyPatchArgs.has(tc.index) && tc.function?.arguments) {
-                  applyPatchArgs.set(
-                    tc.index,
-                    (applyPatchArgs.get(tc.index) || "") + tc.function.arguments
-                  );
-                }
-              }
-            }
-
-            // Check for finish_reason — time to potentially fix and emit
-            const choice0 = data?.choices?.[0];
-            if (choice0 && "finish_reason" in choice0 && choice0.finish_reason != null) {
-              if (hasApplyPatch) {
-                // Check if any accumulated args need conversion
-                let needsConversion = false;
-                for (const [idx, args] of applyPatchArgs) {
-                  if (args.length > 0) {
-                    const { converted } = fixApplyPatchArgs(args);
-                    if (converted) {
-                      needsConversion = true;
-                      break;
-                    }
-                  }
-                }
-
-                if (needsConversion) {
-                  // Re-emit the buffered stream with fixed args
-                  console.log(`   [patch-fix] Converting ApplyPatch args in buffered stream (${bufferedChunks.length} chunks buffered)`);
-                  emitFixedChunks(controller);
-                  // Also emit this final chunk
-                  controller.enqueue(value);
-                  isBuffering = false;
-                  return;
-                } else if (applyPatchArgs.size > 0) {
-                  // Had ApplyPatch but no conversion needed — verify format is actually correct
-                  for (const [idx, args] of applyPatchArgs) {
-                    if (args.length > 0) {
-                      try {
-                        const parsed = JSON.parse(args);
-                        const patchStr = parsed.patch || parsed.input || parsed.diff || "";
-                        if (typeof patchStr === "string" && patchStr.length > 0) {
-                          const hasCursorFmt = patchStr.includes("*** Begin Patch") || patchStr.includes("*** Add File:") || patchStr.includes("*** Update File:");
-                          if (!hasCursorFmt) {
-                            console.warn(`   ⚠️  [patch-fix] ApplyPatch args (index=${idx}) passed through WITHOUT Cursor *** format and WITHOUT conversion. Patch preview: ${patchStr.substring(0, 200)}`);
-                          } else {
-                            console.log(`   [patch-fix] ApplyPatch args (index=${idx}) already in Cursor *** format ✓`);
-                          }
-                        }
-                      } catch {
-                        console.warn(`   ⚠️  [patch-fix] ApplyPatch args (index=${idx}) are not valid JSON — passed through raw. Preview: ${args.substring(0, 200)}`);
-                      }
-                    }
-                  }
-                }
-              }
-              // No conversion needed — flush buffered chunks as-is
-              if (isBuffering) {
-                for (const chunk of bufferedChunks) {
-                  controller.enqueue(chunk);
-                }
-                bufferedChunks = [];
-                bufferedTexts = [];
-                isBuffering = false;
-              }
-            }
-          } catch (sseParseErr) {
-            // SSE line wasn't valid JSON — this is normal for partial chunks split across TCP reads
-            // but we should log if we're in buffering mode as it might indicate data issues
-            if (isBuffering && line.length > 10) {
-              console.warn(`   ⚠️  [patch-fix] Failed to parse SSE line while buffering ApplyPatch (${line.length}c): ${line.substring(0, 100)}`);
-            }
-          }
-        }
-
-        if (isBuffering) {
-          bufferedChunks.push(value);
-          bufferedTexts.push(text);
-        } else {
-          controller.enqueue(value);
-        }
-      } catch (error) {
-        if (isCancelled) return;
-        // Flush any buffered chunks before re-throwing
-        if (isBuffering) {
-          for (const chunk of bufferedChunks) {
-            controller.enqueue(chunk);
-          }
-        }
-        throw error;
-      }
-    },
-    cancel() {
-      isCancelled = true;
-      reader.cancel();
-    },
-  });
-
-  function emitBufferedChunks(controller: ReadableStreamDefaultController): void {
-    for (const chunk of bufferedChunks) {
-      controller.enqueue(chunk);
-    }
-    bufferedChunks = [];
-    bufferedTexts = [];
-  }
-
-  function emitFixedChunks(controller: ReadableStreamDefaultController): void {
-    // Build the fixed argument strings
-    const fixedArgs = new Map<number, string>();
-    for (const [idx, args] of applyPatchArgs) {
-      if (args.length > 0) {
-        const { fixed, converted } = fixApplyPatchArgs(args);
-        fixedArgs.set(idx, converted ? fixed : args);
-      }
-    }
-
-    // Re-emit all buffered chunks, replacing ApplyPatch argument deltas
-    const fullText = bufferedTexts.join("");
-    const events = fullText.split("\n\n").filter((e) => e.trim());
-    const fixedEvents: string[] = [];
-
-    // Track how much of the fixed args we've emitted per index
-    const emittedArgsForIndex = new Map<number, boolean>();
-
-    for (const event of events) {
-      if (!event.startsWith("data: ") || event === "data: [DONE]") {
-        fixedEvents.push(event);
-        continue;
-      }
-
-      try {
-        const data = JSON.parse(event.substring(6));
-        const delta = data?.choices?.[0]?.delta;
-
-        if (delta?.tool_calls) {
-          let modified = false;
-          for (const tc of delta.tool_calls) {
-            if (tc.index != null && fixedArgs.has(tc.index)) {
-              if (tc.function?.name === "ApplyPatch" && !emittedArgsForIndex.get(tc.index)) {
-                // First chunk for this tool call — emit with complete fixed args
-                tc.function.arguments = fixedArgs.get(tc.index) || "";
-                emittedArgsForIndex.set(tc.index, true);
-                modified = true;
-              } else if (tc.function?.arguments && emittedArgsForIndex.get(tc.index)) {
-                // Subsequent argument delta chunks — emit with empty args (already sent)
-                tc.function.arguments = "";
-                modified = true;
-              }
-            }
-          }
-          if (modified) {
-            fixedEvents.push("data: " + JSON.stringify(data));
-            continue;
-          }
-        }
-      } catch (fixParseErr) {
-        // SSE event wasn't parseable — log it since we're actively fixing a stream
-        console.warn(`   ⚠️  [patch-fix] Failed to parse SSE event during fix-up (${event.length}c): ${event.substring(0, 100)}`);
-      }
-
-      fixedEvents.push(event);
-    }
-
-    const fixedText = fixedEvents.join("\n\n") + "\n\n";
-    controller.enqueue(encoder.encode(fixedText));
-
-    bufferedChunks = [];
-    bufferedTexts = [];
-    console.log(`   [patch-fix] Emitted stream with fixed ApplyPatch arguments`);
-  }
-
-  const headers = new Headers(response.headers);
-  return new Response(wrappedStream, { status: response.status, headers });
-}
-
-// ── Stream error wrapper ────────────────────────────────────────────────
-// The openai-oauth library returns streaming responses with status 200 immediately.
-// If the Codex backend returns an error (e.g., usage_limit_reached), the library
-// calls controller.error() on the ReadableStream — which just abruptly kills the
-// stream. Cursor sees the stream stop but gets no error message, so it looks like
-// the model just silently stopped responding.
-//
-// This wrapper intercepts stream aborts and converts them into a proper OpenAI-format
-// error response that Cursor can display to the user.
-
-function wrapStreamWithErrorHandling(response: Response, model: string): Response {
-  const contentType = response.headers.get("content-type") || "";
-  const isSSE = contentType.includes("text/event-stream");
-
-  // Only wrap SSE streaming responses
-  if (!isSSE || !response.body) return response;
-
-  const reader = response.body.getReader();
-  const encoder = new TextEncoder();
-
-  let hasReceivedData = false;
-  let isClosed = false; // Guard against double-close race condition
-
-  // Stream stall detection: if the upstream doesn't send any data for STALL_TIMEOUT_MS,
-  // we close the stream with a helpful error rather than letting Cursor hang for minutes.
-  const STALL_TIMEOUT_MS = 90_000; // 90 seconds — generous, but catches the 2-min hangs
-  let stallTimer: ReturnType<typeof setTimeout> | null = null;
-  let chunkCount = 0;
-
-  function clearStallTimer() {
-    if (stallTimer) {
-      clearTimeout(stallTimer);
-      stallTimer = null;
-    }
-  }
-
-  function resetStallTimer(controller: ReadableStreamDefaultController) {
-    clearStallTimer();
-    stallTimer = setTimeout(() => {
-      if (isClosed) return;
-      const msg = `OpenAI stream stalled — no data received for ${STALL_TIMEOUT_MS / 1000}s after ${chunkCount} chunks. The model may be overloaded. Please retry.`;
-      console.error(`\n❌ [OpenAI Codex] ${msg}`);
-      const errorPayload = {
-        error: { message: msg, type: "stream_timeout", code: "stream_timeout" },
-      };
-      try {
-        controller.enqueue(encoder.encode(`data: ${JSON.stringify(errorPayload)}\n\ndata: [DONE]\n\n`));
-        controller.close();
-      } catch { /* controller may already be closed */ }
-      isClosed = true;
-      reader.cancel().catch(() => {});
-    }, STALL_TIMEOUT_MS);
-  }
-
-  const wrappedStream = new ReadableStream({
-    async pull(controller) {
-      if (isClosed) return;
-      try {
-        // Start/reset stall timer on each pull
-        resetStallTimer(controller);
-
-        const { done, value } = await reader.read();
-
-        clearStallTimer();
-
-        if (done) {
-          if (!isClosed) {
-            isClosed = true;
-            controller.close();
-          }
-          return;
-        }
-        hasReceivedData = true;
-        chunkCount++;
-        controller.enqueue(value);
-      } catch (error: any) {
-        clearStallTimer();
-
-        // If the controller is already closed (Cursor cancelled), just log and exit
-        if (isClosed) {
-          console.warn(`   ⚠️  [stream-error] Stream error after controller already closed: ${error instanceof Error ? error.message : String(error)}`);
-          return;
-        }
-
-        // Stream was aborted by the library — this is where usage_limit_reached etc. end up
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        console.error(`\n❌ [OpenAI Codex] Stream error intercepted: ${errorMessage}`);
-
-        // Try to extract structured error info using multiple sources:
-        // 1. The error's responseBody (Vercel AI SDK APICallError)
-        // 2. The error message text
-        // 3. The lastCodexError from the logger callback
-        let userFacingMessage = `OpenAI error: ${errorMessage}`;
-        let errorType = "api_error";
-
-        // Source 1: Vercel AI SDK APICallError carries responseBody
-        if (error?.responseBody) {
-          console.error(`   responseBody: ${error.responseBody}`);
-          const enhanced = parseAndEnhanceCodexError(error.responseBody, error.statusCode || 500);
-          if (enhanced) {
-            userFacingMessage = enhanced.message;
-            errorType = enhanced.type;
-          }
-        }
-
-        // Source 2: Check error message for embedded JSON or known patterns
-        if (errorType === "api_error") {
-          const jsonMatch = errorMessage.match(/\{[\s\S]*"error"[\s\S]*\}/);
-          if (jsonMatch) {
-            const enhanced = parseAndEnhanceCodexError(jsonMatch[0], 500);
-            if (enhanced) {
-              userFacingMessage = enhanced.message;
-              errorType = enhanced.type;
-            }
-          } else if (errorMessage.includes("usage_limit") || errorMessage.includes("usage limit")) {
-            userFacingMessage = "OpenAI usage limit reached. Switch to a Claude model or wait for the limit to reset.";
-            errorType = "usage_limit_reached";
-          } else if (errorMessage.includes("rate_limit")) {
-            userFacingMessage = "OpenAI rate limit hit. Please wait a moment and try again.";
-            errorType = "rate_limit_error";
-          }
-        }
-
-        // Source 3: Recent error from the logger callback
-        if (errorType === "api_error" && lastCodexError && (Date.now() - lastCodexError.timestamp) < 5000) {
-          const errMsg = lastCodexError.message;
-          if (errMsg.includes("usage_limit") || errMsg.includes("usage limit")) {
-            userFacingMessage = "OpenAI usage limit reached. Switch to a Claude model or wait for the limit to reset.";
-            errorType = "usage_limit_reached";
-          }
-        }
-
-        // Build an OpenAI-format error SSE event so Cursor can display it
-        const errorPayload = {
-          error: {
-            message: userFacingMessage,
-            type: errorType,
-            code: errorType,
-          },
-        };
-
-        const errorSSE = `data: ${JSON.stringify(errorPayload)}\n\ndata: [DONE]\n\n`;
-        try {
-          if (!isClosed) {
-            controller.enqueue(encoder.encode(errorSSE));
-            controller.close();
-            isClosed = true;
-          }
-        } catch (closeErr) {
-          console.warn(`   ⚠️  [stream-error] Could not enqueue error SSE (controller may be closed): ${closeErr instanceof Error ? closeErr.message : String(closeErr)}`);
-        }
-      }
-    },
-    cancel() {
-      clearStallTimer();
-      isClosed = true;
-      reader.cancel();
-    },
-  });
-
-  const headers = new Headers(response.headers);
-  return new Response(wrappedStream, {
-    status: response.status,
-    headers,
-  });
-}
+// NOTE:
+// Previous experiments in this file tried a raw /v1/responses passthrough.
+// That path is kept here for reference, but the active production path now uses
+// openai-oauth's /v1/chat/completions execution with a smaller SSE repair layer.
 
 // ── Error parsing helper ────────────────────────────────────────────────
 
@@ -1243,6 +406,15 @@ const APPLY_PATCH_FORMAT_INSTRUCTIONS = `
 
 CRITICAL: You MUST use this EXACT patch format. Do NOT use standard unified diff format (--- a/ +++ b/).
 
+When calling this tool through OpenAI function calling, put the ENTIRE patch text
+inside the JSON string field "patch". The proxy will unwrap that field back into
+raw Cursor ApplyPatch input before execution.
+
+Example tool arguments JSON:
+\`\`\`json
+{"patch":"*** Begin Patch\n*** Update File: src/example.ts\n@@\n-old\n+new\n*** End Patch"}
+\`\`\`
+
 Format:
 \`\`\`
 *** Begin Patch
@@ -1269,7 +441,39 @@ Rules:
 - Use @@ to start each change hunk in Update File sections
 - Include a few context lines (starting with space) around changes for matching
 - NEVER use --- a/path or +++ b/path headers
-- Multiple files can appear in a single patch`;
+- Multiple files can appear in a single patch
+- NEVER send {} for ApplyPatch arguments
+- ALWAYS put the full patch text inside the "patch" string field`;
+
+const APPLY_PATCH_ARGUMENT_SCHEMA = {
+  type: "object",
+  properties: {
+    patch: {
+      type: "string",
+      description:
+        "The full Cursor ApplyPatch payload as a single string, starting with *** Begin Patch and ending with *** End Patch.",
+    },
+  },
+  required: ["patch"],
+  additionalProperties: false,
+};
+
+function unwrapApplyPatchArguments(argsText: string): string {
+  if (!argsText) return "";
+
+  try {
+    const parsed = JSON.parse(argsText);
+    if (typeof parsed === "string") return parsed;
+    if (parsed && typeof parsed === "object") {
+      if (typeof (parsed as any).patch === "string") return (parsed as any).patch;
+      if (typeof (parsed as any).input === "string") return (parsed as any).input;
+    }
+  } catch {
+    // Raw Cursor patch strings are valid here; just pass them through.
+  }
+
+  return argsText;
+}
 
 /** Normalize Cursor's tool definitions to OpenAI format. */
 function normalizeCursorTools(tools: unknown[], model?: string): unknown[] {
@@ -1295,19 +499,822 @@ function normalizeCursorTools(tools: unknown[], model?: string): unknown[] {
       return tool;
     }
 
-    // For GPT models, enhance ApplyPatch description with explicit format instructions
+    // For GPT models, wrap ApplyPatch as a JSON object tool and teach the model
+    // to place the raw patch text inside the required "patch" field.
     if (isGPT && normalized.function?.name === "ApplyPatch") {
       normalized = {
         ...normalized,
         function: {
           ...normalized.function,
           description: (normalized.function.description || "") + APPLY_PATCH_FORMAT_INSTRUCTIONS,
+          parameters: APPLY_PATCH_ARGUMENT_SCHEMA,
         },
       };
-      console.log("   [patch-fix] Enhanced ApplyPatch tool description for GPT model");
+      console.log("   [patch-fix] Wrapped ApplyPatch schema for GPT model");
     }
 
     return normalized;
+  });
+}
+
+// ── Chat Completions → Responses API body converter ─────────────────────
+// Experimental/reference helper kept for future investigation.
+// The current production path does NOT send requests through /v1/responses.
+
+function chatCompletionsToResponses(body: Record<string, unknown>): Record<string, unknown> {
+  const messages = (body.messages || []) as NormalizedMessage[];
+  const tools = (body.tools || []) as any[];
+
+  // Extract system/developer messages → instructions
+  const instructionMessages = messages.filter(m => m.role === "system" || m.role === "developer");
+  const conversationMessages = messages.filter(m => m.role !== "system" && m.role !== "developer");
+
+  // Build instructions string from all system/developer messages
+  const instructions = instructionMessages.map(m => extractText(m.content)).join("\n\n") || undefined;
+
+  // Build Responses API input items from conversation messages
+  const input: any[] = [];
+
+  for (const msg of conversationMessages) {
+    if (msg.role === "user") {
+      // User message → EasyInputMessage
+      if (typeof msg.content === "string") {
+        input.push({ role: "user", content: msg.content });
+      } else if (Array.isArray(msg.content)) {
+        // Structured content (images, etc.) → convert to Responses API content format
+        const content = (msg.content as any[]).map((part: any) => {
+          if (part.type === "text") return { type: "input_text", text: part.text || "" };
+          if (part.type === "image_url") return { type: "input_image", image_url: part.image_url?.url || part.image_url };
+          return part; // pass through unknown types
+        });
+        input.push({ role: "user", content });
+      } else {
+        input.push({ role: "user", content: String(msg.content || "") });
+      }
+    } else if (msg.role === "assistant") {
+      // Assistant message with tool_calls → output_text + function_call items
+      if (msg.content && String(msg.content).trim()) {
+        // Text content → message with output_text content
+        input.push({
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: String(msg.content) }],
+        });
+      }
+      // Tool calls → separate function_call items
+      if (msg.tool_calls && msg.tool_calls.length > 0) {
+        // If no text content was emitted, we still need the assistant context
+        if (!msg.content || !String(msg.content).trim()) {
+          // Push an empty assistant message to maintain conversation flow
+          input.push({
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "" }],
+          });
+        }
+        for (const tc of msg.tool_calls) {
+          input.push({
+            type: "function_call",
+            call_id: tc.id,
+            name: tc.function.name,
+            arguments: tc.function.arguments,
+          });
+        }
+      }
+    } else if (msg.role === "tool") {
+      // Tool result → function_call_output
+      input.push({
+        type: "function_call_output",
+        call_id: msg.tool_call_id || "unknown",
+        output: typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content),
+      });
+    }
+  }
+
+  // Convert Chat Completions tools → Responses API tools
+  const responsesTools: any[] = tools.map((tool: any) => {
+    if (tool.type === "function" && tool.function) {
+      return {
+        type: "function",
+        name: tool.function.name,
+        description: tool.function.description || "",
+        parameters: tool.function.parameters || { type: "object", properties: {} },
+        strict: false,
+      };
+    }
+    return tool; // pass through unknown types
+  });
+
+  const result: Record<string, unknown> = {
+    model: body.model,
+    input,
+    stream: true,  // Always stream for Cursor
+    instructions,
+    tools: responsesTools.length > 0 ? responsesTools : undefined,
+    // NOTE: openai-oauth's normalizeCodexResponsesBody() deletes max_output_tokens.
+    // The Codex backend will use its own default (typically generous for gpt-5.4).
+    // If output truncation becomes an issue, we may need to bypass the library's normalization.
+    max_output_tokens: body.max_tokens || 16384,
+    temperature: body.temperature,
+    top_p: body.top_p,
+    parallel_tool_calls: body.parallel_tool_calls,
+    reasoning: {
+      effort: body.reasoning_effort || "xhigh",
+      summary: "auto",
+    },
+    // Don't store in the backend — we manage state ourselves
+    store: false,
+  };
+
+  // Clean undefined keys
+  for (const key of Object.keys(result)) {
+    if (result[key] === undefined) delete result[key];
+  }
+
+  return result;
+}
+
+// ── Responses API SSE → Chat Completions SSE converter ──────────────────
+// Experimental/reference helper kept for future investigation.
+//
+// It reads raw Responses API SSE events from the Codex backend and emits
+// proper OpenAI Chat Completions SSE chunks that Cursor expects.
+//
+// Responses API events we handle:
+//   response.output_text.delta → delta.content
+//   response.function_call_arguments.delta → delta.tool_calls[i].function.arguments  
+//   response.output_item.added → start new tool_call or text content
+//   response.output_item.done → (tracking)
+//   response.content_part.added → (tracking)
+//   response.content_part.done → (tracking)
+//   response.completed → finish_reason: "stop" or "tool_calls"
+//   response.failed → error
+//   response.in_progress → (ignore)
+//   response.created → (ignore)
+//   error → error
+
+function responsesStreamToChatCompletions(response: Response, model: string): Response {
+  if (!response.body) {
+    return response;
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+
+  const chatId = `chatcmpl_${crypto.randomUUID()}`;
+  const created = Math.floor(Date.now() / 1000);
+
+  // Track tool call indexes: call_id → index (for Cursor's delta.tool_calls[index])
+  const toolCallIndexes = new Map<string, number>();
+  let nextToolCallIndex = 0;
+  let hasToolCalls = false;
+  let hasTextContent = false;
+  let isCompleted = false;
+  let isClosed = false;
+  let sentAssistantStart = false;
+
+  // Stall detection
+  const INITIAL_STALL_TIMEOUT_MS = 300_000;  // 5 minutes for initial thinking
+  const FLOWING_STALL_TIMEOUT_MS = 120_000;  // 2 minutes once flowing
+  let stallTimer: ReturnType<typeof setTimeout> | null = null;
+  let chunkCount = 0;
+
+  function clearStallTimer() {
+    if (stallTimer) { clearTimeout(stallTimer); stallTimer = null; }
+  }
+
+  function emitChunk(controller: ReadableStreamDefaultController, delta: any, finishReason: string | null = null) {
+    if (isClosed) return;
+    const chunk = {
+      id: chatId,
+      object: "chat.completion.chunk",
+      created,
+      model,
+      choices: [{ index: 0, delta, finish_reason: finishReason }],
+    };
+    controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+  }
+
+  function emitDone(controller: ReadableStreamDefaultController) {
+    if (isClosed) return;
+    controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+  }
+
+  function emitAssistantStart(controller: ReadableStreamDefaultController) {
+    if (isClosed || sentAssistantStart) return;
+    sentAssistantStart = true;
+    emitChunk(controller, { role: "assistant", content: "" });
+  }
+
+  // Buffer for incomplete SSE lines across TCP chunks
+  let sseBuffer = "";
+
+  function processSSELine(line: string, controller: ReadableStreamDefaultController) {
+    if (!line.startsWith("data: ")) return;
+    const dataStr = line.slice(6).trim();
+    if (!dataStr || dataStr === "[DONE]") return;
+
+    let data: any;
+    try {
+      data = JSON.parse(dataStr);
+    } catch (e) {
+      console.warn(`   ⚠️  [responses→chat] Failed to parse SSE data: ${dataStr.substring(0, 200)}`);
+      return;
+    }
+
+    const eventType = data.type as string || "";
+
+    switch (eventType) {
+      case "response.created": {
+        // Emit the standard Chat Completions start chunk immediately so Cursor
+        // doesn't sit on a 200 OK SSE stream with zero bytes while the model reasons.
+        emitAssistantStart(controller);
+        break;
+      }
+
+      case "response.output_text.delta": {
+        // Text content streaming
+        const text = data.delta as string;
+        if (text) {
+          emitAssistantStart(controller);
+          emitChunk(controller, { content: text });
+          hasTextContent = true;
+        }
+        break;
+      }
+
+      case "response.function_call_arguments.delta": {
+        // Tool call argument streaming
+        const callId = data.call_id as string;
+        const delta = data.delta as string;
+        if (!callId || !delta) break;
+
+        let tcIndex = toolCallIndexes.get(callId);
+        if (tcIndex === undefined) {
+          // New tool call — should have been registered by output_item.added,
+          // but handle gracefully if not
+          tcIndex = nextToolCallIndex++;
+          toolCallIndexes.set(callId, tcIndex);
+          hasToolCalls = true;
+          console.warn(`   ⚠️  [responses→chat] function_call_arguments.delta for unknown call_id=${callId}, auto-assigned index=${tcIndex}`);
+        }
+
+        emitChunk(controller, {
+          tool_calls: [{
+            index: tcIndex,
+            function: { arguments: delta },
+          }],
+        });
+        break;
+      }
+
+      case "response.output_item.added": {
+        // New output item being generated
+        const item = data.item;
+        if (!item) break;
+
+        if (item.type === "function_call") {
+          // New tool call starting
+          const callId = item.call_id as string;
+          const name = item.name as string;
+          const tcIndex = nextToolCallIndex++;
+          toolCallIndexes.set(callId, tcIndex);
+          hasToolCalls = true;
+
+          console.log(`   [responses→chat] Tool call started: ${name} (call_id=${callId}, index=${tcIndex})`);
+
+          // Emit the tool call header with role, name, and empty arguments
+          const delta: any = {
+            role: "assistant",
+            tool_calls: [{
+              index: tcIndex,
+              id: callId,
+              type: "function",
+              function: { name: name, arguments: "" },
+            }],
+          };
+          if (sentAssistantStart) {
+            delete delta.role;
+          } else {
+            sentAssistantStart = true;
+          }
+          emitChunk(controller, delta);
+
+        } else if (item.type === "message") {
+          // Message output items do not include a role in the raw Responses SSE.
+          // Treat them as assistant starts so Cursor gets the expected initial chunk.
+          emitAssistantStart(controller);
+        }
+        break;
+      }
+
+      case "response.function_call_arguments.done": {
+        // Tool call arguments complete — no action needed, Cursor assembles from deltas
+        const callId = data.call_id as string;
+        const name = data.name as string;
+        console.log(`   [responses→chat] Tool call arguments done: ${name} (call_id=${callId})`);
+        break;
+      }
+
+      case "response.output_item.done": {
+        // Output item complete
+        const item = data.item;
+        if (item?.type === "function_call") {
+          console.log(`   [responses→chat] Tool call complete: ${item.name} (call_id=${item.call_id})`);
+        }
+        break;
+      }
+
+      case "response.completed": {
+        // Response complete — determine finish_reason
+        isCompleted = true;
+        const finishReason = hasToolCalls ? "tool_calls" : "stop";
+        console.log(`   [responses→chat] Response completed. finish_reason=${finishReason}, hasToolCalls=${hasToolCalls}, hasText=${hasTextContent}`);
+
+        // Extract usage info if available
+        const usage = data.response?.usage;
+        if (usage) {
+          console.log(`   [responses→chat] Usage: input=${usage.input_tokens || 0}, output=${usage.output_tokens || 0}, reasoning=${usage.output_tokens_details?.reasoning_tokens || 0}`);
+        }
+
+        // Emit final chunk with finish_reason
+        emitChunk(controller, {}, finishReason);
+        emitDone(controller);
+        break;
+      }
+
+      case "response.failed": {
+        // Response failed — emit error
+        isCompleted = true;  // Prevent duplicate finish on stream end
+        const error = data.response?.error || data.error;
+        const errorMsg = error?.message || "Unknown error from Codex backend";
+        const errorType = error?.code || error?.type || "api_error";
+        console.error(`\n❌ [responses→chat] Response failed: ${errorType}: ${errorMsg}`);
+
+        // Emit error as a Chat Completions error event
+        const errorPayload = {
+          error: { message: errorMsg, type: errorType },
+        };
+        if (!isClosed) {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(errorPayload)}\n\n`));
+          emitDone(controller);
+        }
+        break;
+      }
+
+      case "response.output_text.done": {
+        // Text output complete — logged for debugging
+        break;
+      }
+
+      case "response.content_part.added":
+      case "response.content_part.done":
+      case "response.in_progress":
+        // Informational events — ignore
+        break;
+
+      case "error": {
+        // Top-level error event
+        isCompleted = true;  // Prevent duplicate finish on stream end
+        const errorMsg = data.message || data.error?.message || "Unknown stream error";
+        const errorType = data.code || data.error?.type || "stream_error";
+        console.error(`\n❌ [responses→chat] Stream error: ${errorType}: ${errorMsg}`);
+
+        const errorPayload = {
+          error: { message: errorMsg, type: errorType },
+        };
+        if (!isClosed) {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(errorPayload)}\n\n`));
+          emitDone(controller);
+        }
+        break;
+      }
+
+      default: {
+        // FAIL FAST: log unrecognized events so we can add support
+        if (eventType) {
+          console.warn(`   ⚠️  [responses→chat] Unhandled Responses API event: ${eventType}. Data preview: ${JSON.stringify(data).substring(0, 300)}`);
+        }
+        break;
+      }
+    }
+  }
+
+  const wrappedStream = new ReadableStream({
+    start(controller) {
+      // Match openai-oauth's chat-completions behavior: emit the initial
+      // assistant role chunk immediately, even if the raw Responses stream
+      // stays silent for a while during heavy reasoning.
+      emitAssistantStart(controller);
+    },
+    async pull(controller) {
+      if (isClosed) return;
+
+      // Reset stall timer
+      clearStallTimer();
+      const timeout = chunkCount < 2 ? INITIAL_STALL_TIMEOUT_MS : FLOWING_STALL_TIMEOUT_MS;
+      stallTimer = setTimeout(() => {
+        if (isClosed) return;
+        const phase = chunkCount < 2 ? "initial thinking" : "mid-stream";
+        const msg = `OpenAI stream stalled — no data for ${timeout / 1000}s (${phase}) after ${chunkCount} chunks. The model may be overloaded. Please retry.`;
+        console.error(`\n❌ [OpenAI Codex] ${msg}`);
+        if (!isClosed) {
+          try {
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: { message: msg, type: "stream_timeout" } })}\n\ndata: [DONE]\n\n`));
+            controller.close();
+          } catch { /* already closed */ }
+          isClosed = true;
+        }
+        reader.cancel().catch(() => {});
+      }, timeout);
+
+      try {
+        const { done, value } = await reader.read();
+        clearStallTimer();
+
+        if (done) {
+          // Stream ended — make sure we emitted a completion
+          if (!isCompleted && !isClosed) {
+            console.warn(`   ⚠️  [responses→chat] Stream ended without response.completed event`);
+            const finishReason = hasToolCalls ? "tool_calls" : "stop";
+            emitChunk(controller, {}, finishReason);
+            emitDone(controller);
+          }
+          if (!isClosed) {
+            isClosed = true;
+            controller.close();
+          }
+          return;
+        }
+
+        chunkCount++;
+        const text = decoder.decode(value, { stream: true });
+        sseBuffer += text;
+
+        // Process complete SSE lines
+        const lines = sseBuffer.split("\n");
+        // Keep the last potentially incomplete line
+        sseBuffer = lines.pop() || "";
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed) {
+            processSSELine(trimmed, controller);
+          }
+        }
+      } catch (error: any) {
+        clearStallTimer();
+        if (isClosed) return;
+
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        console.error(`\n❌ [responses→chat] Stream read error: ${errorMsg}`);
+
+        // Try to emit error to Cursor
+        try {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+            error: { message: `OpenAI stream error: ${errorMsg}`, type: "stream_error" },
+          })}\n\ndata: [DONE]\n\n`));
+          controller.close();
+        } catch { /* already closed */ }
+        isClosed = true;
+      }
+    },
+    cancel() {
+      clearStallTimer();
+      isClosed = true;
+      reader.cancel().catch(() => {});
+    },
+  });
+
+  return new Response(wrappedStream, {
+    status: 200,
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+    },
+  });
+}
+
+// ── Chat Completions SSE repair wrapper ──────────────────────────────────
+// We intentionally execute GPT requests through openai-oauth's
+// /v1/chat/completions path because it streams real content promptly, even for
+// very large Cursor agent payloads. The trade-off is that the emitted SSE has a
+// critical Cursor-breaking bug:
+//   - ALL responses (both tool-call AND text-only) end with finish_reason: null
+//     instead of "tool_calls" or "stop". Without a proper finish_reason, Cursor
+//     interprets the response as interrupted/incomplete and resends the request,
+//     causing an infinite loop where the model repeats the same action forever.
+//   - usage chunks may arrive before a proper finish_reason chunk
+//   - mid-stream upstream errors can terminate the stream without a helpful
+//     error payload for Cursor
+//
+// This wrapper repairs those issues without changing the underlying execution
+// path that actually works well with GPT-5.4.
+function repairChatCompletionsStream(response: Response, model: string): Response {
+  const contentType = response.headers.get("content-type") || "";
+  if (!contentType.includes("text/event-stream") || !response.body) {
+    return response;
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+
+  let isClosed = false;
+  let sseBuffer = "";
+  let hasToolCalls = false;
+  let hasTextContent = false;
+  let hasFinishReason = false;
+  const applyPatchCallIndexes = new Set<number>();
+  const applyPatchArgBuffers = new Map<number, string>();
+  let lastId = `chatcmpl_${crypto.randomUUID()}`;
+  let lastModel = model;
+  let lastCreated = Math.floor(Date.now() / 1000);
+  let stallTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const STALL_TIMEOUT_MS = 180_000;
+
+  function clearStallTimer() {
+    if (stallTimer) {
+      clearTimeout(stallTimer);
+      stallTimer = null;
+    }
+  }
+
+  function injectFinishReason(controller: ReadableStreamDefaultController) {
+    if (isClosed || hasFinishReason) return;
+    hasFinishReason = true;
+    const reason = hasToolCalls ? "tool_calls" : "stop";
+    const finishChunk = {
+      id: lastId,
+      object: "chat.completion.chunk",
+      created: lastCreated,
+      model: lastModel,
+      choices: [{ index: 0, delta: {}, finish_reason: reason }],
+    };
+    controller.enqueue(encoder.encode(`data: ${JSON.stringify(finishChunk)}\n\n`));
+    console.log(`   [chat-fix] Injected finish_reason=${reason}`);
+  }
+
+  function flushBufferedApplyPatchArgs(controller: ReadableStreamDefaultController) {
+    if (isClosed || applyPatchArgBuffers.size === 0) return;
+
+    for (const [index, wrappedArgs] of Array.from(applyPatchArgBuffers.entries())) {
+      const patchText = unwrapApplyPatchArguments(wrappedArgs);
+      if (!patchText) continue;
+
+      const patchChunk = {
+        id: lastId,
+        object: "chat.completion.chunk",
+        created: lastCreated,
+        model: lastModel,
+        choices: [{
+          index: 0,
+          delta: {
+            tool_calls: [{
+              index,
+              function: { arguments: patchText },
+            }],
+          },
+          finish_reason: null,
+        }],
+      };
+
+      controller.enqueue(encoder.encode(`data: ${JSON.stringify(patchChunk)}\n\n`));
+      console.log(`   [patch-fix] Unwrapped ApplyPatch arguments for Cursor (${patchText.length} chars)`);
+    }
+
+    applyPatchArgBuffers.clear();
+  }
+
+  function processEvent(eventText: string, controller: ReadableStreamDefaultController): boolean {
+    const lines = eventText.split("\n").filter(Boolean);
+    const dataLines = lines
+      .filter((line) => line.startsWith("data: "))
+      .map((line) => line.slice(6));
+
+    if (dataLines.length === 0) {
+      controller.enqueue(encoder.encode(eventText + "\n\n"));
+      return true;
+    }
+
+    const dataText = dataLines.join("\n").trim();
+    if (!dataText) return false;
+
+    if (dataText === "[DONE]") {
+      flushBufferedApplyPatchArgs(controller);
+      injectFinishReason(controller);
+      controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+      return true;
+    }
+
+    try {
+      const parsed = JSON.parse(dataText);
+      if (typeof parsed.id === "string") lastId = parsed.id;
+      if (typeof parsed.model === "string") lastModel = parsed.model;
+      if (typeof parsed.created === "number") lastCreated = parsed.created;
+
+      const choices = Array.isArray(parsed.choices) ? parsed.choices : [];
+      const choice0 = choices[0];
+      const delta = choice0?.delta;
+
+      if (Array.isArray(delta?.tool_calls) && delta.tool_calls.length > 0) {
+        hasToolCalls = true;
+
+        const hadOnlyToolCalls =
+          delta &&
+          typeof delta === "object" &&
+          !Array.isArray(delta) &&
+          Object.keys(delta).length === 1 &&
+          Array.isArray(delta.tool_calls);
+
+        const forwardedToolCalls: any[] = [];
+        for (const toolCall of delta.tool_calls) {
+          const index = typeof toolCall?.index === "number" ? toolCall.index : null;
+          const name = toolCall?.function?.name;
+          const argDelta = typeof toolCall?.function?.arguments === "string"
+            ? toolCall.function.arguments
+            : "";
+
+          if (name === "ApplyPatch" && index !== null) {
+            applyPatchCallIndexes.add(index);
+            if (argDelta) {
+              applyPatchArgBuffers.set(index, (applyPatchArgBuffers.get(index) || "") + argDelta);
+            }
+
+            forwardedToolCalls.push({
+              index,
+              id: toolCall.id,
+              type: toolCall.type,
+              function: {
+                name,
+                arguments: "",
+              },
+            });
+            continue;
+          }
+
+          if (index !== null && applyPatchCallIndexes.has(index)) {
+            if (argDelta) {
+              applyPatchArgBuffers.set(index, (applyPatchArgBuffers.get(index) || "") + argDelta);
+            }
+            continue;
+          }
+
+          forwardedToolCalls.push(toolCall);
+        }
+
+        if (forwardedToolCalls.length > 0) {
+          delta.tool_calls = forwardedToolCalls;
+        } else if (hadOnlyToolCalls && choice0?.finish_reason == null && choices.length === 1 && !parsed.usage) {
+          return false;
+        } else {
+          delete delta.tool_calls;
+        }
+      }
+
+      if (typeof delta?.content === "string" && delta.content.length > 0) {
+        hasTextContent = true;
+      }
+
+      if (typeof choice0?.finish_reason === "string" && choice0.finish_reason) {
+        hasFinishReason = true;
+      }
+
+      // openai-oauth emits the terminal chunk as delta:{} with finish_reason:null
+      // for BOTH tool-call and text-only responses. Detect this pattern and inject
+      // the correct finish_reason so Cursor knows the response is complete.
+      if (
+        choice0 &&
+        choice0.finish_reason == null &&
+        delta &&
+        typeof delta === "object" &&
+        !Array.isArray(delta) &&
+        Object.keys(delta).length === 0 &&
+        (hasToolCalls || hasTextContent)
+      ) {
+        const reason = hasToolCalls ? "tool_calls" : "stop";
+        choice0.finish_reason = reason;
+        hasFinishReason = true;
+      }
+
+      if (
+        applyPatchArgBuffers.size > 0 &&
+        (
+          (choice0 && typeof choice0.finish_reason === "string" && choice0.finish_reason) ||
+          (
+            choice0 &&
+            choice0.finish_reason == null &&
+            delta &&
+            typeof delta === "object" &&
+            !Array.isArray(delta) &&
+            Object.keys(delta).length === 0 &&
+            hasToolCalls
+          ) ||
+          (choices.length === 0 && parsed.usage)
+        )
+      ) {
+        flushBufferedApplyPatchArgs(controller);
+      }
+
+      // If a usage-only chunk arrives before we ever got a finish_reason, inject
+      // one immediately before forwarding the usage chunk.
+      if (!hasFinishReason && choices.length === 0 && parsed.usage) {
+        injectFinishReason(controller);
+      }
+
+      controller.enqueue(encoder.encode(`data: ${JSON.stringify(parsed)}\n\n`));
+      return true;
+    } catch {
+      // If parsing fails, forward the raw event instead of dropping it.
+      controller.enqueue(encoder.encode(eventText + "\n\n"));
+      return true;
+    }
+  }
+
+  const wrappedStream = new ReadableStream({
+    async pull(controller) {
+      if (isClosed) return;
+
+      try {
+        while (!isClosed) {
+          clearStallTimer();
+          stallTimer = setTimeout(() => {
+            if (isClosed) return;
+            const msg = `OpenAI chat-completions stream stalled for ${STALL_TIMEOUT_MS / 1000}s.`;
+            console.error(`\n❌ [OpenAI Codex] ${msg}`);
+            try {
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+                error: { message: msg, type: "stream_timeout" },
+              })}\n\ndata: [DONE]\n\n`));
+              controller.close();
+            } catch { /* already closed */ }
+            isClosed = true;
+            reader.cancel().catch(() => {});
+          }, STALL_TIMEOUT_MS);
+
+          const { done, value } = await reader.read();
+          clearStallTimer();
+
+          if (done) {
+            if (!isClosed) {
+              flushBufferedApplyPatchArgs(controller);
+              injectFinishReason(controller);
+              isClosed = true;
+              controller.close();
+            }
+            return;
+          }
+
+          sseBuffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+          const events = sseBuffer.split("\n\n");
+          sseBuffer = events.pop() || "";
+
+          let emittedSomething = false;
+          for (const eventText of events) {
+            const trimmed = eventText.trim();
+            if (trimmed) {
+              emittedSomething = processEvent(trimmed, controller) || emittedSomething;
+            }
+          }
+
+          if (emittedSomething) {
+            return;
+          }
+        }
+      } catch (error: any) {
+        clearStallTimer();
+        if (isClosed) return;
+
+        const rawMessage = error instanceof Error ? error.message : String(error);
+        const enhanced =
+          (lastCodexError ? parseAndEnhanceCodexError(lastCodexError.message, 500) : null) ||
+          parseAndEnhanceCodexError(rawMessage, 500);
+
+        const errorPayload = enhanced
+          ? { error: { message: enhanced.message, type: enhanced.type } }
+          : { error: { message: `OpenAI stream error: ${rawMessage}`, type: "stream_error" } };
+
+        console.error(`\n❌ [OpenAI Codex] Stream read error: ${rawMessage}`);
+        try {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(errorPayload)}\n\ndata: [DONE]\n\n`));
+          controller.close();
+        } catch { /* already closed */ }
+        isClosed = true;
+      }
+    },
+    cancel() {
+      clearStallTimer();
+      isClosed = true;
+      reader.cancel().catch(() => {});
+    },
+  });
+
+  return new Response(wrappedStream, {
+    status: response.status,
+    headers: new Headers(response.headers),
   });
 }
 
@@ -1325,14 +1332,11 @@ export async function handleOpenAICodexRequest(req: Request): Promise<Response> 
     body.tools = normalizeCursorTools(body.tools, String(body.model || ""));
   }
 
-  // Inject default reasoning_effort
-  // The openai-oauth library's Zod schema only allows: "none"|"minimal"|"low"|"medium"|"high"
-  // "xhigh" is NOT supported by the library — it would cause a validation error.
-  // We map "xhigh" → "high" (the maximum supported value).
-  const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high"]);
+  // Set reasoning effort — now goes directly to Responses API which supports "xhigh" for gpt-5.4+
+  const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
   const rawEffort = (body.reasoning_effort as string) || config.openaiCodexReasoningEffort || "high";
   if (!VALID_REASONING_EFFORTS.has(rawEffort)) {
-    console.warn(`   ⚠️  [OpenAI Codex] reasoning_effort "${rawEffort}" not supported by openai-oauth library — mapping to "high"`);
+    console.warn(`   ⚠️  [OpenAI Codex] reasoning_effort "${rawEffort}" not recognized — mapping to "high"`);
     body.reasoning_effort = "high";
   } else {
     body.reasoning_effort = rawEffort;
@@ -1359,11 +1363,13 @@ export async function handleOpenAICodexRequest(req: Request): Promise<Response> 
         role: "developer",
         content:
           "IMPORTANT: When using the ApplyPatch tool, you MUST format patches with " +
+          "a JSON arguments object whose single string field is `patch`. " +
+          "Put the ENTIRE patch text inside that `patch` field; the proxy will unwrap it before Cursor executes the tool. " +
           "*** Begin Patch / *** Add File: <path> / *** Update File: <path> / " +
           "*** Delete File: <path> / *** End Patch headers. " +
           "Use @@ to start each change hunk. " +
           "NEVER use standard unified diff format (--- a/ +++ b/ headers). " +
-          "The patch will be REJECTED if you use the wrong format.",
+          "The patch will be REJECTED if you use the wrong format or if you send `{}`.",
       };
       // Insert after the first system/developer message, or at position 0
       const firstNonSystemIdx = body.messages.findIndex(
@@ -1428,7 +1434,15 @@ export async function handleOpenAICodexRequest(req: Request): Promise<Response> 
   // Debug logging — writes detailed request data to openai-debug.log
   const debugInfo = debugLogRequest(body);
 
-  // Build a Request for the openai-oauth handler
+  // ── Production architecture: openai-oauth chat-completions + targeted SSE repair ──
+  // Raw /v1/responses passthrough looked attractive on paper, but for real
+  // Cursor-sized GPT-5.4 agent payloads it can sit on a 200 OK response without
+  // emitting any visible content for a very long time. The openai-oauth
+  // /v1/chat/completions route, despite its finish_reason bugs, streams real
+  // assistant content promptly. We therefore execute through chat-completions and
+  // repair the broken SSE details that Cursor cares about.
+  console.log(`   [chat-repair] Sending to /v1/chat/completions via openai-oauth`);
+
   const internalRequest = new Request("http://internal/v1/chat/completions", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -1441,33 +1455,21 @@ export async function handleOpenAICodexRequest(req: Request): Promise<Response> 
   try {
     response = await oauthHandler(internalRequest);
   } catch (handlerError: any) {
-    // The handler itself threw — this should be rare since createOpenAIOAuthFetchHandler
-    // has its own catch, but handle it defensively.
     const msg = handlerError instanceof Error ? handlerError.message : String(handlerError);
     console.error(`\n❌ [OpenAI Codex] Handler error: ${msg}`);
     debugLogError(debugInfo, msg, handlerError?.responseBody);
 
-    // Check if it's a Vercel AI SDK APICallError (has statusCode and responseBody)
     const statusCode = handlerError?.statusCode;
     const respBody = handlerError?.responseBody;
 
     if (respBody) {
       console.error(`   responseBody: ${respBody}`);
-      // Try to parse and enhance known error types
-      try {
-        const parsed = JSON.parse(respBody);
-        if (parsed?.error?.type === "usage_limit_reached") {
-          const resetsAt = parsed.error.resets_at;
-          const resetTime = resetsAt ? new Date(resetsAt * 1000) : null;
-          const enhanced = `OpenAI usage limit reached (${parsed.error.plan_type || "Plus"} plan).${resetTime ? ` Resets at: ${resetTime.toLocaleString()}` : ""} Switch to a Claude model or wait for the limit to reset.`;
-          console.error(`⚠️  [OpenAI Codex] Usage limit reached!${resetTime ? ` Resets at: ${resetTime.toLocaleString()}` : ""}`);
-          return Response.json(
-            { error: { message: enhanced, type: "usage_limit_reached" } },
-            { status: statusCode || 429, headers: { "Access-Control-Allow-Origin": "*" } }
-          );
-        }
-      } catch (respParseErr) {
-        console.warn(`   ⚠️  [handler-error] Could not parse responseBody as JSON: ${respParseErr instanceof Error ? respParseErr.message : "parse error"}`);
+      const enhanced = parseAndEnhanceCodexError(respBody, statusCode || 500);
+      if (enhanced) {
+        return Response.json(
+          { error: { message: enhanced.message, type: enhanced.type } },
+          { status: enhanced.status, headers: { "Access-Control-Allow-Origin": "*" } }
+        );
       }
     }
 
@@ -1477,7 +1479,7 @@ export async function handleOpenAICodexRequest(req: Request): Promise<Response> 
     );
   }
 
-  // Log non-200 responses clearly so they're visible in the proxy console
+  // Log non-200 responses
   if (!response.ok) {
     let errorBody = "";
     try {
@@ -1485,11 +1487,10 @@ export async function handleOpenAICodexRequest(req: Request): Promise<Response> 
     } catch (cloneErr) {
       console.warn(`   ⚠️  [handler] Could not read error response body: ${cloneErr instanceof Error ? cloneErr.message : "read error"}`);
     }
-    console.error(`\n❌ [OpenAI Codex] HTTP ${response.status} error from openai-oauth:`);
+    console.error(`\n❌ [OpenAI Codex] HTTP ${response.status} error:`);
     console.error(`   responseBody: ${JSON.stringify(errorBody)}`);
     debugLogError(debugInfo, `HTTP ${response.status}`, errorBody);
 
-    // Parse and enhance known error types for better Cursor display
     const enhanced = parseAndEnhanceCodexError(errorBody, response.status);
     if (enhanced) {
       return Response.json(
@@ -1500,35 +1501,21 @@ export async function handleOpenAICodexRequest(req: Request): Promise<Response> 
 
     const responseHeaders = new Headers(response.headers);
     responseHeaders.set("Access-Control-Allow-Origin", "*");
-
-    return new Response(response.body, {
-      status: response.status,
-      headers: responseHeaders,
-    });
+    return new Response(response.body, { status: response.status, headers: responseHeaders });
   }
 
   debugLogResponse(debugInfo, response.status, !!body.stream);
 
-  // Pipeline: fix finish_reason → fix ApplyPatch format → debug log → error handling
-  // Each wrapper passes the stream through, potentially modifying it.
+  const repairedStream = repairChatCompletionsStream(response, String(body.model || "gpt-5.4"));
 
-  // 1. Cursor must see finish_reason: "tool_calls" or it drops tool_calls and loops.
-  let processedResponse = fixToolCallFinishReason(response);
+  // Debug logger for visibility
+  const debuggedStream = debugWrapStream(repairedStream, debugInfo);
 
-  // 2. Convert wrong-format ApplyPatch arguments (unified diff → Cursor *** format).
-  processedResponse = fixApplyPatchFormat(processedResponse);
-
-  // 3. Debug logger sees the same bytes as Cursor (post-fix), so openai-debug.log matches reality.
-  processedResponse = debugWrapStream(processedResponse, debugInfo);
-
-  // 4. Wrap streaming responses to catch mid-stream errors (usage_limit_reached, etc.)
-  processedResponse = wrapStreamWithErrorHandling(processedResponse, String(body.model));
-
-  const responseHeaders = new Headers(processedResponse.headers);
+  const responseHeaders = new Headers(debuggedStream.headers);
   responseHeaders.set("Access-Control-Allow-Origin", "*");
 
-  return new Response(processedResponse.body, {
-    status: processedResponse.status,
+  return new Response(debuggedStream.body, {
+    status: debuggedStream.status,
     headers: responseHeaders,
   });
 }

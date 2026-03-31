@@ -114,7 +114,7 @@ export function getConfig(): ProxyConfig {
     // OpenAI Codex subscription proxy (auto-detected from credentials)
     openaiCodexFirst: process.env.OPENAI_CODEX_FIRST !== "false",
     openaiCodexDefaultModel: process.env.OPENAI_CODEX_DEFAULT_MODEL || "gpt-5.4",
-    openaiCodexReasoningEffort: process.env.OPENAI_CODEX_REASONING_EFFORT || "high",
+    openaiCodexReasoningEffort: process.env.OPENAI_CODEX_REASONING_EFFORT || "xhigh",
   };
 
   return cachedConfig;

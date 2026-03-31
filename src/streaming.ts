@@ -139,6 +139,31 @@ export function createAnthropicToOpenAIStream(
                 );
               }
 
+              if (event.type === "error") {
+                const errorType = event.error?.type || "anthropic_stream_error";
+                const errorMessage = event.error?.message || "Unknown Anthropic stream error";
+                console.log(`   [Error] Anthropic SSE error: ${errorType}: ${errorMessage}`);
+
+                safeEnqueue(
+                  new TextEncoder().encode(
+                    `data: ${JSON.stringify({
+                      error: {
+                        message: `Anthropic stream error: ${errorMessage}`,
+                        type: errorType,
+                      },
+                    })}\n\n`
+                  )
+                );
+                safeEnqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+                cancelled = true;
+                try {
+                  controller.close();
+                } catch {
+                  // Controller already closed
+                }
+                break;
+              }
+
               // Handle message_start
               if (event.type === "message_start" && !sentStart) {
                 if (event.message?.usage?.input_tokens) {

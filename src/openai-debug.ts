@@ -134,6 +134,15 @@ export function debugLogRequest(body: Record<string, unknown>): DebugRequestInfo
       const t = tool as any;
       const name = t.function?.name || t.name || "?";
       write(`  • ${name}`);
+      if (name === "ApplyPatch") {
+        const parameters = t.function?.parameters || t.parameters;
+        const hasWrappedPatchSchema =
+          parameters?.type === "object" &&
+          parameters?.properties?.patch?.type === "string" &&
+          Array.isArray(parameters?.required) &&
+          parameters.required.includes("patch");
+        write(`      schema: ${hasWrappedPatchSchema ? "wrapped-json-patch" : "legacy-or-unknown"}`);
+      }
     }
     write("");
   }
@@ -249,14 +258,17 @@ export function debugWrapStream(
   let textContent = "";
   let toolCallNames: string[] = [];
   let finishReason = "";
+  let isClosed = false;
   // Track full ApplyPatch tool call arguments for logging
   const applyPatchArgBuffers = new Map<number, string>();
 
   const wrappedStream = new ReadableStream({
     async pull(controller) {
+      if (isClosed) return;
       try {
         const { done, value } = await reader.read();
         if (done) {
+          if (isClosed) return;
           // Log stream completion summary
           write(`[${ts()}] STREAM END #${info.seq} — ${chunkCount} chunks, ${totalBytes} bytes, ${Date.now() - info.startTime}ms`);
           if (textContent) {
@@ -272,6 +284,7 @@ export function debugWrapStream(
             write(`  Finish reason: ${finishReason}`);
           }
           write("");
+          isClosed = true;
           controller.close();
           return;
         }
@@ -325,46 +338,48 @@ export function debugWrapStream(
                   if (args.length > 0) {
                     write(`[${ts()}] STREAM #${info.seq} ApplyPatch args (index=${idx}, ${args.length}c):`);
                     // Log the full patch content for diagnosis
+                    let patchStr = args;
                     try {
                       const parsed = JSON.parse(args);
-                      const patchContent = parsed.patch || parsed.input || JSON.stringify(parsed);
-                      const patchStr = typeof patchContent === "string" ? patchContent : JSON.stringify(patchContent);
-                      const patchLines = patchStr.split("\n");
-                      if (patchLines.length > 30) {
-                        write(`  ${patchLines.slice(0, 15).join("\n  ")}`);
-                        write(`  ... (${patchLines.length - 30} lines omitted) ...`);
-                        write(`  ${patchLines.slice(-15).join("\n  ")}`);
-                      } else {
-                        write(`  ${patchStr.replace(/\n/g, "\n  ")}`);
-                      }
-                      // Check format — comprehensive detection matching handler logic
-                      const hasCursorFormat = patchStr.includes("*** Begin Patch") ||
-                        patchStr.includes("*** Add File:") || patchStr.includes("*** Update File:") ||
-                        patchStr.includes("*** Delete File:");
-                      const hasUnifiedFormat = patchStr.includes("--- a/") || patchStr.includes("--- /dev/null") ||
-                        patchStr.includes("+++ b/") || /^diff --git /m.test(patchStr);
-                      const hasRawDiffPair = /^---\s+\S/m.test(patchStr) && /^\+\+\+\s+\S/m.test(patchStr);
-                      const hasRawHunks = /^@@\s/m.test(patchStr) && (/^\+[^+]/m.test(patchStr) || /^-[^-]/m.test(patchStr));
+                      const patchContent = parsed.patch || parsed.input || parsed;
+                      patchStr = typeof patchContent === "string" ? patchContent : JSON.stringify(patchContent);
+                    } catch {
+                      // Raw Cursor patch strings are valid here after the proxy unwraps them.
+                    }
 
-                      let formatLabel: string;
-                      if (hasCursorFormat) {
-                        formatLabel = "Cursor *** ✓";
-                      } else if (hasUnifiedFormat) {
-                        formatLabel = "UNIFIED DIFF (wrong! should have been converted)";
-                      } else if (hasRawDiffPair) {
-                        formatLabel = "UNIFIED DIFF without a/b prefix (wrong! should have been converted)";
-                      } else if (hasRawHunks) {
-                        formatLabel = "RAW @@ HUNKS (wrong! should have been converted)";
-                      } else {
-                        formatLabel = "UNKNOWN FORMAT — may cause Cursor rejection";
-                      }
-                      write(`  Format: ${formatLabel}`);
-                      if (!hasCursorFormat) {
-                        console.warn(`   ⚠️  [debug] ApplyPatch reached Cursor in NON-Cursor format: ${formatLabel}. Preview: ${patchStr.substring(0, 150)}`);
-                      }
-                    } catch (patchParseErr) {
-                      write(`  (raw, ${args.length}c): ${args.substring(0, 500)}${args.length > 500 ? "..." : ""}`);
-                      console.warn(`   ⚠️  [debug] Could not parse ApplyPatch args as JSON: ${patchParseErr instanceof Error ? patchParseErr.message : "parse error"}`);
+                    const patchLines = patchStr.split("\n");
+                    if (patchLines.length > 30) {
+                      write(`  ${patchLines.slice(0, 15).join("\n  ")}`);
+                      write(`  ... (${patchLines.length - 30} lines omitted) ...`);
+                      write(`  ${patchLines.slice(-15).join("\n  ")}`);
+                    } else {
+                      write(`  ${patchStr.replace(/\n/g, "\n  ")}`);
+                    }
+
+                    // Check format — comprehensive detection matching handler logic
+                    const hasCursorFormat = patchStr.includes("*** Begin Patch") ||
+                      patchStr.includes("*** Add File:") || patchStr.includes("*** Update File:") ||
+                      patchStr.includes("*** Delete File:");
+                    const hasUnifiedFormat = patchStr.includes("--- a/") || patchStr.includes("--- /dev/null") ||
+                      patchStr.includes("+++ b/") || /^diff --git /m.test(patchStr);
+                    const hasRawDiffPair = /^---\s+\S/m.test(patchStr) && /^\+\+\+\s+\S/m.test(patchStr);
+                    const hasRawHunks = /^@@\s/m.test(patchStr) && (/^\+[^+]/m.test(patchStr) || /^-[^-]/m.test(patchStr));
+
+                    let formatLabel: string;
+                    if (hasCursorFormat) {
+                      formatLabel = "Cursor *** ✓";
+                    } else if (hasUnifiedFormat) {
+                      formatLabel = "UNIFIED DIFF (wrong! should have been converted)";
+                    } else if (hasRawDiffPair) {
+                      formatLabel = "UNIFIED DIFF without a/b prefix (wrong! should have been converted)";
+                    } else if (hasRawHunks) {
+                      formatLabel = "RAW @@ HUNKS (wrong! should have been converted)";
+                    } else {
+                      formatLabel = "UNKNOWN FORMAT — may cause Cursor rejection";
+                    }
+                    write(`  Format: ${formatLabel}`);
+                    if (!hasCursorFormat) {
+                      console.warn(`   ⚠️  [debug] ApplyPatch reached Cursor in NON-Cursor format: ${formatLabel}. Preview: ${patchStr.substring(0, 150)}`);
                     }
                   }
                 }
@@ -379,6 +394,7 @@ export function debugWrapStream(
           }
         }
       } catch (error) {
+        if (isClosed) return;
         const msg = error instanceof Error ? error.message : String(error);
         write(`[${ts()}] STREAM ERROR #${info.seq} — ${msg}`);
         write(`  After ${chunkCount} chunks, ${totalBytes} bytes, ${Date.now() - info.startTime}ms`);
@@ -386,7 +402,8 @@ export function debugWrapStream(
       }
     },
     cancel() {
-      reader.cancel();
+      isClosed = true;
+      reader.cancel().catch(() => {});
       write(`[${ts()}] STREAM CANCELLED #${info.seq} after ${chunkCount} chunks`);
     },
   });
