@@ -10,7 +10,7 @@ import { getConfig, ANTHROPIC_BETA_COMPACTION } from "./config";
 
 
 export interface OpenAIMessage {
-  role: "system" | "user" | "assistant" | "tool";
+  role: "system" | "developer" | "user" | "assistant" | "tool";
   content: string | OpenAIContentPart[] | null;
   tool_calls?: OpenAIToolCall[];
   tool_call_id?: string;
@@ -18,7 +18,7 @@ export interface OpenAIMessage {
 }
 
 export interface OpenAIContentPart {
-  type: "text" | "image_url";
+  type: "text" | "input_text" | "output_text" | "image_url";
   text?: string;
   image_url?: {
     url: string;
@@ -173,7 +173,7 @@ function convertContent(
 
     // Handle OpenAI format parts
     const openaiPart = part as OpenAIContentPart;
-    if (openaiPart.type === "text") {
+    if (openaiPart.type === "text" || openaiPart.type === "input_text" || openaiPart.type === "output_text") {
       // Only add text blocks if they have non-empty content
       if (openaiPart.text && openaiPart.text.trim().length > 0) {
         blocks.push({ type: "text", text: openaiPart.text });
@@ -261,8 +261,9 @@ export function openaiToAnthropic(request: OpenAIChatRequest): AnthropicRequest 
   }
 
   for (const msg of request.messages) {
-    if (msg.role === "system") {
-      // Collect system messages
+    if (msg.role === "system" || msg.role === "developer") {
+      // Collect system/developer messages into Anthropic system prompt.
+      // Developer messages carry critical workflow instructions and must not be dropped.
       const content =
         typeof msg.content === "string" ? msg.content : (msg.content || []).map((p) => p.text || "").join("\n");
       if (system) {
