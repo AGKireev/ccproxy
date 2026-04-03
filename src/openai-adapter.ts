@@ -124,6 +124,16 @@ export interface OpenAIStreamChunk {
  * - claude-4.6-opus-high → claude-opus-4-6 (with reasoning_budget: high)
  */
 export function normalizeModelName(model: string): { model: string; reasoningBudget?: string; minorVersion?: number } {
+  // Custom alias for Cursor custom model entries routed through OpenAI-compatible proxies.
+  // Treat `ccproxy` as the strongest Claude route: Opus 4.6 with max-thinking semantics.
+  if (model === "ccproxy") {
+    return {
+      model: "claude-opus-4-6",
+      reasoningBudget: "max",
+      minorVersion: 6,
+    };
+  }
+
   // Handle Cursor's format: claude-4.{minor}-{model}-{budget} or claude-4.{minor}-{model}-{budget}-thinking
   const match = model.match(/^claude-4\.(\d+)-(opus|sonnet|haiku)(?:-(high|medium|low|max))?(?:-thinking)?$/);
   if (match) {

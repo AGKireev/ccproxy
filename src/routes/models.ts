@@ -8,6 +8,13 @@ export function handleModelsRequest(): Response {
 
   // context_window: 1M for 4.6 models (GA since March 2026), 200K for 4.5 models
   const models: any[] = [
+    {
+      id: "ccproxy",
+      object: "model",
+      created: 1738800000,
+      owned_by: "anthropic",
+      context_window: 1000000,
+    },
     // Claude 4.6 models (Anthropic format) — 1M context GA
     {
       id: "claude-opus-4-6",
